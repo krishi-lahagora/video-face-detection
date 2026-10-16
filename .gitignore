@@ -1,0 +1,26 @@
+# Environment & Secrets (NEVER COMMIT)
+.env
+.env.local
+*.env
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual Environments
+venv/
+env/
+envv/
+.venv/
+
+# Uploaded media (avoid large files in git)
+static/uploads/*
+!static/uploads/.gitkeep
+
+# OS generated files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

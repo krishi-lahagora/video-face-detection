@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 8px 0;
+            background: transparent;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            color: #f1f5f9;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .player-wrapper {
+            width: 100%;
+            max-width: 820px;
+            background: #000;
+            border-radius: 14px;
+            overflow: hidden;
+            box-shadow: 0 8px 30px rgba(0,0,0,0.6);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        video {
+            width: 100%;
+            max-height: 450px;
+            display: block;
+            background: #000;
+        }
+        .controls-bar {
+            width: 100%;
+            max-width: 820px;
+            margin-top: 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            align-items: center;
+        }
+        .status-badge {
+            font-size: 0.88rem;
+            font-weight: 700;
+            padding: 8px 20px;
+            border-radius: 9999px;
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            transition: all 0.3s ease;
+        }
+        .status-live {
+            color: #ef4444;
+            border: 1px solid rgba(239, 68, 68, 0.4);
+            background: rgba(239, 68, 68, 0.12);
+        }
+        .status-paused {
+            color: #38bdf8;
+            border: 1px solid rgba(56, 189, 248, 0.5);
+            background: rgba(56, 189, 248, 0.15);
+            box-shadow: 0 0 15px rgba(56, 189, 248, 0.25);
+        }
+        .btn-detect {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 50%, #b91c1c 100%);
+            color: #ffffff;
+            border: 1px solid rgba(255, 255, 255, 0.25);
+            padding: 15px 36px;
+            font-size: 1.05rem;
+            font-weight: 800;
+            border-radius: 9999px;
+            cursor: pointer;
+            box-shadow: 0 4px 25px rgba(239, 68, 68, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+            transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            width: 100%;
+            justify-content: center;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .btn-detect:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(239, 68, 68, 0.7);
+            background: linear-gradient(135deg, #f87171 0%, #ef4444 50%, #dc2626 100%);
+        }
+        .btn-detect:active {
+            transform: translateY(1px);
+        }
+        .pulse-dot {
+            width: 10px;
+            height: 10px;
+            background: #ef4444;
+            border-radius: 50%;
+            box-shadow: 0 0 10px #ef4444;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.4; transform: scale(0.85); }
+        }
+    </style>
+</head>
+<body>
+    <div class="player-wrapper">
+        <video id="liveHlsVideo" controls autoplay muted playsinline crossorigin="anonymous"></video>
+    </div>
+
+    <div class="controls-bar">
+        <div id="statusBadge" class="status-badge status-live">
+            <span class="pulse-dot" id="statusDot"></span>
+            <span id="statusText">🔴 Live TV Playing — Pause video anytime to capture actor!</span>
+        </div>
+
+        <button class="btn-detect" id="captureBtn" onclick="onDetectClick()">
+            <span style="font-size: 1.25rem;">🎯</span>
+            <span id="btnText">Capture from Currently Paused Frame</span>
+        </button>
+    </div>
+
+    <script>
+        let vid = document.getElementById("liveHlsVideo");
+        let statusBadge = document.getElementById("statusBadge");
+        let statusDot = document.getElementById("statusDot");
+        let statusText = document.getElementById("statusText");
+        let btnText = document.getElementById("btnText");
+        let currentStreamUrl = "";
+        let hls = null;
+
+        function sendMessageToStreamlit(type, data) {
+            window.parent.postMessage(Object.assign({
+                isStreamlitMessage: true,
+                type: type
+            }, data || {}), "*");
+        }
+
+        function setComponentReady() {
+            sendMessageToStreamlit("streamlit:componentReady", { apiVersion: 1 });
+        }
+
+        function setFrameHeight(h) {
+            sendMessageToStreamlit("streamlit:setFrameHeight", { height: h || 580 });
+        }
+
+        function setComponentValue(val) {
+            sendMessageToStreamlit("streamlit:setComponentValue", { value: val });
+        }
+
+        function initStream(url) {
+            if (!url || url === currentStreamUrl) return;
+            currentStreamUrl = url;
+
+            if (hls) {
+                hls.destroy();
+                hls = null;
+            }
+
+            if (Hls.isSupported()) {
+                hls = new Hls({ enableWorker: true, lowLatencyMode: true });
+                hls.loadSource(url);
+                hls.attachMedia(vid);
+                hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                    vid.play().catch(function(e) { console.log("Autoplay note:", e); });
+                });
+                hls.on(Hls.Events.ERROR, function(event, data) {
+                    console.warn("HLS stream warning:", data);
+                });
+            } else if (vid.canPlayType('application/vnd.apple.mpegurl')) {
+                vid.src = url;
+                vid.play().catch(function(e) { console.log("Autoplay note:", e); });
+            }
+        }
+
+        vid.addEventListener("play", function() {
+            statusBadge.className = "status-badge status-live";
+            statusDot.style.background = "#ef4444";
+            statusDot.style.boxShadow = "0 0 10px #ef4444";
+            statusText.innerText = "🔴 Live TV Playing — Pause video anytime to capture actor!";
+            btnText.innerText = "Pause & Detect Person from Live TV";
+        });
+
+        vid.addEventListener("pause", function() {
+            statusBadge.className = "status-badge status-paused";
+            statusDot.style.background = "#38bdf8";
+            statusDot.style.boxShadow = "0 0 10px #38bdf8";
+            let pTime = (vid.currentTime || 0).toFixed(1);
+            statusText.innerText = "⏸️ PAUSED at " + pTime + "s — Ready to Capture & Detect!";
+            btnText.innerText = "🎯 Detect Person from This Paused Frame";
+        });
+
+        function onDetectClick() {
+            vid.pause();
+
+            let base64Img = "";
+            let tainted = false;
+
+            try {
+                let canvas = document.createElement("canvas");
+                canvas.width = vid.videoWidth || 1280;
+                canvas.height = vid.videoHeight || 720;
+                let ctx = canvas.getContext("2d");
+                ctx.drawImage(vid, 0, 0, canvas.width, canvas.height);
+                base64Img = canvas.toDataURL("image/jpeg", 0.95);
+            } catch (err) {
+                console.warn("Canvas capture note (CORS):", err);
+                tainted = true;
+            }
+
+            setComponentValue({
+                image_base64: base64Img,
+                is_tainted: tainted,
+                paused_time: vid.currentTime || 0.0,
+                nonce: Date.now()
+            });
+        }
+
+        window.addEventListener("DOMContentLoaded", function() {
+            setComponentReady();
+            setFrameHeight(580);
+        });
+
+        window.addEventListener("message", function(e) {
+            if (e.data && e.data.type === "streamlit:render") {
+                let args = e.data.args || {};
+                if (args.stream_url) {
+                    initStream(args.stream_url);
+                }
+                setFrameHeight(580);
+            }
+        });
+    </script>
+</body>
+</html>

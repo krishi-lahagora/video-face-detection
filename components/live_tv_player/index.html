@@ -14,6 +14,7 @@
             display: flex;
             flex-direction: column;
             align-items: center;
+            overflow-x: hidden;
         }
         .player-wrapper {
             width: 100%;
@@ -23,10 +24,14 @@
             overflow: hidden;
             box-shadow: 0 8px 30px rgba(0,0,0,0.6);
             border: 1px solid rgba(255, 255, 255, 0.1);
+            position: relative;
+            aspect-ratio: 16 / 9;
+            min-height: 250px;
         }
         video {
             width: 100%;
-            max-height: 450px;
+            height: 100%;
+            object-fit: contain;
             display: block;
             background: #000;
         }
@@ -114,7 +119,7 @@
 
         <button class="btn-detect" id="captureBtn" onclick="onDetectClick()">
             <span style="font-size: 1.25rem;">🎯</span>
-            <span id="btnText">Capture from Currently Paused Frame</span>
+            <span id="btnText">Pause & Detect Person from Live TV</span>
         </button>
     </div>
 
@@ -126,6 +131,7 @@
         let btnText = document.getElementById("btnText");
         let currentStreamUrl = "";
         let hls = null;
+        let lastHeight = 0;
 
         function sendMessageToStreamlit(type, data) {
             window.parent.postMessage(Object.assign({
@@ -139,15 +145,21 @@
         }
 
         function setFrameHeight(h) {
-            sendMessageToStreamlit("streamlit:setFrameHeight", { height: h || 580 });
+            let target = h || document.body.scrollHeight || 580;
+            if (Math.abs(target - lastHeight) > 4) {
+                lastHeight = target;
+                sendMessageToStreamlit("streamlit:setFrameHeight", { height: target });
+            }
         }
 
         function setComponentValue(val) {
             sendMessageToStreamlit("streamlit:setComponentValue", { value: val });
         }
 
-        function initStream(url) {
-            if (!url || url === currentStreamUrl) return;
+        function initStream(url, force) {
+            if (!url) return;
+            url = url.trim();
+            if (!force && url === currentStreamUrl) return;
             currentStreamUrl = url;
 
             if (hls) {
@@ -156,14 +168,50 @@
             }
 
             if (Hls.isSupported()) {
-                hls = new Hls({ enableWorker: true, lowLatencyMode: true });
+                hls = new Hls({
+                    enableWorker: true,
+                    lowLatencyMode: false,               // Prevents constant buffer starvation & flickering
+                    backBufferLength: 30,                // 30s back-buffer
+                    maxBufferLength: 30,                 // Buffer ahead by 30s
+                    maxMaxBufferLength: 60,              // Keep max 60s
+                    maxBufferSize: 60 * 1000 * 1000,     // 60MB buffer max
+                    liveSyncDurationCount: 3,            // Keep 3 segments safe distance from live edge
+                    liveMaxLatencyDurationCount: 8,      // Smooth latency catch-up without drops
+                    liveDurationInfinity: true,
+                    manifestLoadingTimeOut: 15000,
+                    levelLoadingTimeOut: 15000,
+                    fragLoadingTimeOut: 20000,
+                    fragLoadingMaxRetry: 6,
+                    startFragPrefetch: true
+                });
+
                 hls.loadSource(url);
                 hls.attachMedia(vid);
+
                 hls.on(Hls.Events.MANIFEST_PARSED, function() {
                     vid.play().catch(function(e) { console.log("Autoplay note:", e); });
                 });
+
                 hls.on(Hls.Events.ERROR, function(event, data) {
-                    console.warn("HLS stream warning:", data);
+                    if (data.fatal) {
+                        switch (data.type) {
+                            case Hls.ErrorTypes.NETWORK_ERROR:
+                                console.warn("Network error encountered, trying to recover...", data);
+                                hls.startLoad();
+                                break;
+                            case Hls.ErrorTypes.MEDIA_ERROR:
+                                console.warn("Media error encountered, trying to recover...", data);
+                                hls.recoverMediaError();
+                                break;
+                            default:
+                                console.error("Fatal error, recovering player...", data);
+                                hls.destroy();
+                                setTimeout(function() {
+                                    initStream(currentStreamUrl, true);
+                                }, 1200);
+                                break;
+                        }
+                    }
                 });
             } else if (vid.canPlayType('application/vnd.apple.mpegurl')) {
                 vid.src = url;

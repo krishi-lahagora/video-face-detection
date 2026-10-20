@@ -192,27 +192,46 @@
                     vid.play().catch(function(e) { console.log("Autoplay note:", e); });
                 });
 
+                let fatalRetryCount = 0;
                 hls.on(Hls.Events.ERROR, function(event, data) {
                     if (data.fatal) {
                         switch (data.type) {
                             case Hls.ErrorTypes.NETWORK_ERROR:
                                 console.warn("Network error encountered, trying to recover...", data);
-                                hls.startLoad();
+                                fatalRetryCount++;
+                                if (fatalRetryCount <= 3) {
+                                    hls.startLoad();
+                                } else {
+                                    statusBadge.className = "status-badge status-live";
+                                    statusDot.style.background = "#f59e0b";
+                                    statusText.innerText = "⚠️ Live Stream Offline or Unreachable (Network Error).";
+                                }
                                 break;
                             case Hls.ErrorTypes.MEDIA_ERROR:
                                 console.warn("Media error encountered, trying to recover...", data);
                                 hls.recoverMediaError();
                                 break;
                             default:
-                                console.error("Fatal error, recovering player...", data);
-                                hls.destroy();
-                                setTimeout(function() {
-                                    initStream(currentStreamUrl, true);
-                                }, 1200);
+                                fatalRetryCount++;
+                                if (fatalRetryCount <= 2) {
+                                    console.warn(`Recovering player (attempt ${fatalRetryCount}/2)...`, data);
+                                    hls.destroy();
+                                    setTimeout(function() {
+                                        initStream(currentStreamUrl, true);
+                                    }, 2000);
+                                } else {
+                                    console.error("Stream stopped: URL returned invalid or empty manifest.", data);
+                                    hls.destroy();
+                                    statusBadge.className = "status-badge status-live";
+                                    statusDot.style.background = "#f59e0b";
+                                    statusDot.style.boxShadow = "0 0 10px #f59e0b";
+                                    statusText.innerText = "⚠️ Live Stream Offline or Empty Playlist. Please check the URL.";
+                                }
                                 break;
                         }
                     }
                 });
+
             } else if (vid.canPlayType('application/vnd.apple.mpegurl')) {
                 vid.src = url;
                 vid.play().catch(function(e) { console.log("Autoplay note:", e); });

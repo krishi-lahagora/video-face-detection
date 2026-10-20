@@ -8,34 +8,11 @@ import requests
 from PIL import Image
 from dotenv import load_dotenv
 
-try:
-    import face_recognition
-except ImportError:
-    face_recognition = None
-
-
 # Load environment variables from .env file
 load_dotenv()
 
-# Streamlit config - sidebar collapsed and hidden
-st.set_page_config(
-    page_title="Celebrity Video & Live Recognition Studio",
-    page_icon="🌟",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
-
-# Hide Streamlit sidebar completely via CSS
-st.markdown("""
-<style>
-    [data-testid="stSidebar"], section[data-testid="stSidebar"] {
-        display: none !important;
-    }
-    [data-testid="collapsedControl"] {
-        display: none !important;
-    }
-</style>
-""", unsafe_allow_html=True)
+# Streamlit config
+st.set_page_config(page_title="Celebrity Recognition (Gemini AI)", page_icon="🌟", layout="wide")
 
 # Create upload folder
 UPLOAD_FOLDER = "static/uploads"
@@ -58,180 +35,63 @@ if os.path.exists(live_tv_player_path):
     except Exception as e:
         live_tv_player = None
 
-# Gemini Configuration (loaded from .env directly without sidebar)
-GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
-gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+# Sidebar - Gemini Configuration
+st.sidebar.title("⚙️ AI Configuration")
+env_gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+user_gemini_key = st.sidebar.text_input(
+    "Google Gemini API Key",
+    value=st.session_state.get("gemini_key", env_gemini_key),
+    type="password",
+    help="Enter your Google Gemini API key or set GEMINI_API_KEY in .env"
+)
+if user_gemini_key:
+    st.session_state["gemini_key"] = user_gemini_key.strip()
+    GEMINI_API_KEY = user_gemini_key.strip()
+    st.sidebar.success("🟢 Gemini API Ready")
+else:
+    GEMINI_API_KEY = ""
+    st.sidebar.warning("⚠️ Enter Gemini API key above or in .env")
 
-# ==========================================
-# ROBUST FACE DETECTION & BOUNDING BOX ENGINE
-# ==========================================
+gemini_model = st.sidebar.selectbox(
+    "Gemini Model",
+    ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-1.5-flash"],
+    index=0
+)
 
-def non_max_suppression(boxes, overlap_thresh=0.35):
-    """Merges overlapping duplicate bounding boxes around the same face into a single clean box."""
-    if not boxes or len(boxes) == 0:
-        return []
-    boxes = np.array(boxes, dtype=int)
-    pick = []
-    x1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x2 = boxes[:, 0] + boxes[:, 2]
-    y2 = boxes[:, 1] + boxes[:, 3]
-    area = (x2 - x1 + 1) * (y2 - y1 + 1)
-    idxs = np.argsort(y2)
-    while len(idxs) > 0:
-        last = len(idxs) - 1
-        i = idxs[last]
-        pick.append(i)
-        xx1 = np.maximum(x1[i], x1[idxs[:last]])
-        yy1 = np.maximum(y1[i], y1[idxs[:last]])
-        xx2 = np.minimum(x2[i], x2[idxs[:last]])
-        yy2 = np.minimum(y2[i], y2[idxs[:last]])
-        w = np.maximum(0, xx2 - xx1 + 1)
-        h = np.maximum(0, yy2 - yy1 + 1)
-        overlap = (w * h) / (area[idxs[:last]] + 1e-6)
-        idxs = np.delete(idxs, np.concatenate(([last], np.where(overlap > overlap_thresh)[0])))
-    return [(int(boxes[i][0]), int(boxes[i][1]), int(boxes[i][2]), int(boxes[i][3])) for i in pick]
-
-
-def is_valid_face_box(box, img_w, img_h):
-    """Strictly filters out background objects (furniture, doors, patterns) using face geometric proportions."""
-    x, y, w, h = box
-    if w < 32 or h < 32:
-        return False
-    # Check boundaries
-    if x < 0 or y < 0 or (x + w) > img_w * 1.05 or (y + h) > img_h * 1.05:
-        return False
-    # Human face aspect ratio: width to height ratio must strictly be between 0.60 and 1.35
-    aspect_ratio = float(w) / float(h)
-    if aspect_ratio < 0.60 or aspect_ratio > 1.35:
-        return False
-    # Invalidate full-screen or gargantuan boxes
-    if w > img_w * 0.90 or h > img_h * 0.90:
-        return False
-    return True
-
-
-def detect_faces_from_rgb(img_rgb, high_sensitivity=False):
-    """Detects faces in an RGB image with multi-tier robust fallback and geometric verification to prevent background false positives."""
-    if img_rgb is None or not isinstance(img_rgb, np.ndarray) or img_rgb.size == 0:
-        return []
-
-    img_h, img_w = img_rgb.shape[:2]
-    candidate_boxes = []
-
-    # Tier 1: face_recognition (dlib HOG face detector) - zero background false positives
-    if face_recognition is not None:
-        try:
-            scale = 1.0
-            if max(img_h, img_w) > 1200:
-                scale = 960.0 / max(img_h, img_w)
-                small_rgb = cv2.resize(img_rgb, (int(img_w * scale), int(img_h * scale)))
-            else:
-                small_rgb = img_rgb
-
-            upsample_count = 1 if (high_sensitivity or min(img_h, img_w) < 500) else 0
-            locs = face_recognition.face_locations(small_rgb, number_of_times_to_upsample=upsample_count, model="hog")
-            
-            # If nothing found and high sensitivity requested, retry with higher upsample
-            if len(locs) == 0 and high_sensitivity:
-                locs = face_recognition.face_locations(small_rgb, number_of_times_to_upsample=2, model="hog")
-
-            for (top, right, bottom, left) in locs:
-                if scale != 1.0:
-                    top = int(top / scale)
-                    right = int(right / scale)
-                    bottom = int(bottom / scale)
-                    left = int(left / scale)
-                box_w = max(10, right - left)
-                box_h = max(10, bottom - top)
-                box = (int(left), int(top), int(box_w), int(box_h))
-                if is_valid_face_box(box, img_w, img_h):
-                    candidate_boxes.append(box)
-        except Exception as e:
-            print(f"[face_recognition notice] {e}")
-
-    if len(candidate_boxes) > 0:
-        return non_max_suppression(candidate_boxes, overlap_thresh=0.35)
-
-    # Tier 2: OpenCV Cascades with strict minNeighbors to eliminate background noise
+# Face Detection Functions
+def detect_faces_from_rgb(img_rgb):
+    """Detects frontal faces in an RGB image using OpenCV Haar cascade."""
     try:
         gray = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2GRAY)
-        min_n = 4 if high_sensitivity else 6
-        cascade_names = [
-            ('haarcascade_frontalface_alt2.xml', 1.08, min_n),
-            ('haarcascade_frontalface_default.xml', 1.10, min_n + 1),
-            ('haarcascade_profileface.xml', 1.10, min_n)
-        ]
-        for cname, s_factor, c_min_n in cascade_names:
-            cpath = cv2.data.haarcascades + cname
-            if os.path.exists(cpath):
-                cascade = cv2.CascadeClassifier(cpath)
-                detected = cascade.detectMultiScale(gray, scaleFactor=s_factor, minNeighbors=c_min_n, minSize=(42, 42))
-                for (x, y, w, h) in detected:
-                    box = (int(x), int(y), int(w), int(h))
-                    if is_valid_face_box(box, img_w, img_h):
-                        candidate_boxes.append(box)
-
-        if len(candidate_boxes) > 0:
-            return non_max_suppression(candidate_boxes, overlap_thresh=0.35)
-
-        # Tier 3: Adaptive CLAHE contrast enhancement for dim or vintage video footage
-        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
-        eq_gray = clahe.apply(gray)
-        for cname in ['haarcascade_frontalface_alt2.xml', 'haarcascade_frontalface_default.xml']:
-            cpath = cv2.data.haarcascades + cname
-            if os.path.exists(cpath):
-                cascade = cv2.CascadeClassifier(cpath)
-                detected = cascade.detectMultiScale(eq_gray, scaleFactor=1.08, minNeighbors=4, minSize=(36, 36))
-                for (x, y, w, h) in detected:
-                    box = (int(x), int(y), int(w), int(h))
-                    if is_valid_face_box(box, img_w, img_h):
-                        candidate_boxes.append(box)
+        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=4, minSize=(40, 40))
+        if len(faces) == 0:
+            return []
+        return faces
     except Exception as e:
-        print(f"[OpenCV Face Detection Error] {e}")
-
-    return non_max_suppression(candidate_boxes, overlap_thresh=0.35)
-
+        print(f"[Face Detection Error] {e}")
+        return []
 
 def draw_faces(image, faces, celebrity_name):
-    """Draws sleek bounding boxes and prominent badges around detected faces."""
+    """Draws bounding boxes and labels around detected faces."""
     annotated = image.copy()
-    display_label = celebrity_name if celebrity_name and celebrity_name != "Unknown" else "Identified Celebrity"
+    display_label = celebrity_name if celebrity_name and celebrity_name != "Unknown" else "Detected Person"
     
     for (x, y, w, h) in faces:
-        # 1. Main bounding box (Vibrant Emerald / Cyan)
-        cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 230, 115), 3)
-
-        # 2. Sleek Corner accents
-        line_len = max(12, int(min(w, h) * 0.18))
-        thickness = 5
-        corner_color = (0, 255, 200)
-        # Top-Left
-        cv2.line(annotated, (x, y), (x + line_len, y), corner_color, thickness)
-        cv2.line(annotated, (x, y), (x, y + line_len), corner_color, thickness)
-        # Top-Right
-        cv2.line(annotated, (x + w, y), (x + w - line_len, y), corner_color, thickness)
-        cv2.line(annotated, (x + w, y), (x + w, y + line_len), corner_color, thickness)
-        # Bottom-Left
-        cv2.line(annotated, (x, y + h), (x + line_len, y + h), corner_color, thickness)
-        cv2.line(annotated, (x, y + h), (x, y + h - line_len), corner_color, thickness)
-        # Bottom-Right
-        cv2.line(annotated, (x + w, y + h), (x + w - line_len, y + h), corner_color, thickness)
-        cv2.line(annotated, (x + w, y + h), (x + w, y + h - line_len), corner_color, thickness)
+        # Draw box
+        cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 255, 120), 3)
         
-        # 3. Floating label badge above the bounding box
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.8
-        font_thick = 2
-        label_size, baseline = cv2.getTextSize(display_label, font, font_scale, font_thick)
-        top_y = max(y - 12, label_size[1] + 12)
-        cv2.rectangle(annotated, (x, top_y - label_size[1] - 8), (x + label_size[0] + 16, top_y + 4), (0, 180, 90), -1)
-        cv2.putText(annotated, display_label, (x + 8, top_y - 2), font, font_scale, (0, 0, 0), font_thick, cv2.LINE_AA)
+        # Label background
+        label_size, _ = cv2.getTextSize(display_label, cv2.FONT_HERSHEY_SIMPLEX, 0.85, 2)
+        top_y = max(y - 12, label_size[1] + 10)
+        cv2.rectangle(annotated, (x, top_y - label_size[1] - 8), (x + label_size[0] + 12, top_y + 4), (0, 200, 100), -1)
+        cv2.putText(annotated, display_label, (x + 6, top_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 0), 2, cv2.LINE_AA)
         
     return annotated
 
 def extract_frame_at_timestamp(video_path, timestamp_seconds):
-    """Extracts a video frame at a given timestamp in seconds with accurate seeking."""
+    """Extracts a video frame at a given timestamp in seconds."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return None, []
@@ -245,12 +105,6 @@ def extract_frame_at_timestamp(video_path, timestamp_seconds):
         
     cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
     ret, frame = cap.read()
-    
-    # Fallback seek by milliseconds if POS_FRAMES fails or is inaccurate
-    if not ret or frame is None:
-        cap.set(cv2.CAP_PROP_POS_MSEC, timestamp_seconds * 1000.0)
-        ret, frame = cap.read()
-
     cap.release()
     
     if not ret or frame is None:
@@ -259,7 +113,6 @@ def extract_frame_at_timestamp(video_path, timestamp_seconds):
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     faces = detect_faces_from_rgb(frame_rgb)
     return frame_rgb, faces
-
 
 def extract_name(content):
     """Parses the real celebrity / person full name from Gemini response."""
@@ -281,76 +134,38 @@ def extract_name(content):
                     return name
     return "Unknown"
 
-
 def get_info(image_data, api_key=None, model=None):
-    """Sends image to Gemini API to recognize the celebrity or public figure with Google Knowledge Graph / AI Overview depth."""
-    # Convert image_data into base64 and optimize resolution for fast network transport
+    """Sends image to Gemini API to recognize the celebrity or public figure."""
+    # Convert image_data into base64
     if isinstance(image_data, str) and os.path.exists(image_data):
-        img_bgr = cv2.imread(image_data)
-        if img_bgr is not None:
-            image_data = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        else:
-            with open(image_data, "rb") as img_file:
-                img_base64 = base64.b64encode(img_file.read()).decode()
-
-    if isinstance(image_data, np.ndarray):
-        h, w = image_data.shape[:2]
-        # Optimize image size for Vision AI (max 768px keeps details crisp while speeding up inference 10x)
-        scale = min(1.0, 768.0 / max(h, w))
-        if scale < 1.0:
-            small_rgb = cv2.resize(image_data, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-        else:
-            small_rgb = image_data
-        _, buffer = cv2.imencode('.jpg', cv2.cvtColor(small_rgb, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        img_base64 = base64.b64encode(buffer).decode()
+        with open(image_data, "rb") as img_file:
+            img_base64 = base64.b64encode(img_file.read()).decode()
     elif isinstance(image_data, (bytes, bytearray)):
         img_base64 = base64.b64encode(image_data).decode()
-    elif isinstance(image_data, str) and not os.path.exists(image_data):
-        img_base64 = image_data
+    elif isinstance(image_data, np.ndarray):
+        _, buffer = cv2.imencode('.jpg', cv2.cvtColor(image_data, cv2.COLOR_RGB2BGR))
+        img_base64 = base64.b64encode(buffer).decode()
     else:
         return "Unknown"
 
-    prompt_text = """You are an elite, authoritative AI intelligence system trained in identifying real celebrities, actors, actresses, and notable public figures with Google Knowledge Graph / AI Overview accuracy.
+    prompt_text = """You are an expert AI trained in recognizing celebrities, cinema actors, actresses, and famous public figures with high accuracy.
+Carefully analyze the given image and identify the person with certainty.
+If a well-known person is present, return the details in this exact format:
 
-CRITICAL ACCURACY & GROUNDING RULES:
-1. Examine the image carefully. You must ONLY identify the person if you recognize them as a real, globally known public figure / celebrity with HIGH CONFIDENCE based on their facial features.
-2. If the face is unclear, in heavy motion blur, an ordinary person/background extra, or if you are not 100% sure of their identity, you MUST strictly respond with "Unknown".
-3. Do NOT guess, hallucinate, or assume a celebrity based on clothing, background, or objects.
-4. If the image depicts background scenery, inanimate objects, or has no clear human face, respond strictly with "Unknown".
-5. When a recognized celebrity is verified, output the intelligence dossier in this exact structured format:
+- **Full Name**: <Person's Real Full Name>
+- **Profession**: <Profession, e.g. Actor, Actress, Singer, Athlete>
+- **Nationality**: <Country of origin>
+- **Famous For**: <Notable movies, series, or achievements, max 2-3>
 
-- **Full Name**: <Person's Official Full Name>
-- **Profession**: <All primary professions, creative domains, and titles, e.g., Actress and singer>
-- **Nationality**: <Country of origin / nationality>
-- **Claim to Fame**: <A comprehensive summary of why they are globally famous, their historical impact, records, or unique standing in culture/cinema>
-
-### 🏆 Key Achievements & Major Awards
-- **Records & Milestones**: <Specific historic records, milestones, or distinctions (e.g., holding the record of winning five César Awards for Best Actress — more than any other actor in history)>
-- **Major Awards & Nominations**: <Detailed list of major awards such as Academy Award (Oscar) nominations, César Awards, BAFTA, Cannes Film Festival Best Actress/Actor, Berlin Silver Bear, Golden Globes, with years and categories>
-
-### 🎬 Notable Works & Landmark Roles
-- <List 4-6 landmark films, series, musical releases, or career-defining performances with release years and their critical or box office significance>
-
-### 📖 Biographical & Career Overview
-<A detailed, insightful 1-2 paragraph biography summarizing their career trajectory, artistic impact, cultural legacy, and notable milestones.>
-
-If no famous person is recognized with certainty, respond strictly with "Unknown".
+If multiple people are detected, return only the most famous one.
+If no famous person is recognized, respond strictly with "Unknown".
 """
 
-
     key = api_key or GEMINI_API_KEY or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    req_model = model or gemini_model or "gemini-3.1-flash-lite"
+    req_model = model or gemini_model or "gemini-3.8-flash"
     
     if key:
-        # Prioritize modern, high-availability Gemini endpoints
-        models_to_try = [
-            req_model,
-            "gemini-3.1-flash-lite",
-            "gemini-3.5-flash-lite",
-            "gemini-3.5-flash",
-            "gemini-3.8-flash",
-            "gemini-flash-latest"
-        ]
+        models_to_try = [req_model, "gemini-3.8-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
         seen = set()
         models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
 
@@ -367,10 +182,10 @@ If no famous person is recognized with certainty, respond strictly with "Unknown
                     }],
                     "generationConfig": {
                         "temperature": 0.1,
-                        "maxOutputTokens": 2048
+                        "maxOutputTokens": 1024
                     }
                 }
-                response = requests.post(url, json=payload, timeout=25.0)
+                response = requests.post(url, json=payload, timeout=30.0)
                 if response.status_code == 200:
                     data = response.json()
                     candidates = data.get("candidates", [])
@@ -381,12 +196,12 @@ If no famous person is recognized with certainty, respond strictly with "Unknown
                             if ans:
                                 return ans
                 elif response.status_code in [404, 503, 429]:
-                    print(f"[Vision AI Notice] Engine {clean_mod} returned HTTP {response.status_code}, trying next engine...")
+                    print(f"[Gemini Notice] Model {clean_mod} returned HTTP {response.status_code}, trying next model...")
                     continue
                 else:
-                    print(f"[Vision AI Error] HTTP {response.status_code}: {response.text[:200]}")
+                    print(f"[Gemini Error] HTTP {response.status_code}: {response.text[:200]}")
             except Exception as e:
-                print(f"[Vision AI Error on {clean_mod}] {e}, trying next engine...")
+                print(f"[Gemini Error on {clean_mod}] {e}, trying next model...")
                 continue
 
     # Fallback to Groq if configured
@@ -400,22 +215,21 @@ If no famous person is recognized with certainty, respond strictly with "Unknown
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt_text},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}}
                     ]
                 }
             ],
             "temperature": 0.1,
-            "max_tokens": 1500
+            "max_tokens": 1024
         }
         try:
             response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20.0)
             if response.status_code == 200:
-                return response.json()['choices'][0]['message']['content'].strip()
+                return response.json()['choices'][0]['message']['content']
         except Exception as ge:
             print(f"[Groq Error] {ge}")
 
     return "Unknown"
-
 
 
 # ==========================================
@@ -423,26 +237,13 @@ If no famous person is recognized with certainty, respond strictly with "Unknown
 # ==========================================
 
 st.title("🌟 Celebrity Video & Live Stream Recognition")
-st.markdown("Play live TV or any video, click **Detect**, and identify celebrities in real-time with **Advanced Multimodal AI**.")
+st.markdown("Play live TV or any video, click **Detect**, and identify celebrities in real-time with **Google Gemini AI**.")
 
 source_options = [
     "📡 Live TV Stream (M3U8)",
     "📤 Upload Video / Movie File"
 ]
 video_source_type = st.radio("Video Source:", source_options, horizontal=True)
-
-# Clear previous detection states if user switches video source
-if "last_source_type" not in st.session_state:
-    st.session_state["last_source_type"] = video_source_type
-elif st.session_state["last_source_type"] != video_source_type:
-    st.session_state["last_source_type"] = video_source_type
-    st.session_state["v_name"] = None
-    st.session_state["v_info"] = None
-    st.session_state["v_frame"] = None
-    st.session_state["v_faces"] = []
-    st.session_state["v_ts"] = 0.0
-    st.session_state["last_video_nonce"] = None
-    st.session_state["last_live_nonce"] = None
 
 active_video_path = None
 is_live_stream = False
@@ -458,29 +259,8 @@ elif video_source_type == "📤 Upload Video / Movie File":
     uploaded_video = st.file_uploader("Upload a movie / video file (MP4, MOV, AVI, MKV)", type=["mp4", "mov", "avi", "mkv"])
     if uploaded_video is not None:
         active_video_path = os.path.join(UPLOAD_FOLDER, uploaded_video.name)
-        
-        # Reset detection results whenever a NEW video is uploaded (Issue 5 fix)
-        if st.session_state.get("active_uploaded_video_name") != uploaded_video.name:
-            st.session_state["active_uploaded_video_name"] = uploaded_video.name
-            st.session_state["v_name"] = None
-            st.session_state["v_info"] = None
-            st.session_state["v_frame"] = None
-            st.session_state["v_faces"] = []
-            st.session_state["v_ts"] = 0.0
-            st.session_state["last_video_nonce"] = None
-
         with open(active_video_path, "wb") as vf:
             vf.write(uploaded_video.getbuffer())
-    else:
-        # If user clears the upload
-        if st.session_state.get("active_uploaded_video_name") is not None:
-            st.session_state["active_uploaded_video_name"] = None
-            st.session_state["v_name"] = None
-            st.session_state["v_info"] = None
-            st.session_state["v_frame"] = None
-            st.session_state["v_faces"] = []
-            st.session_state["v_ts"] = 0.0
-
 
 # 1. LIVE TV STREAMING
 if is_live_stream and active_video_path:
@@ -496,7 +276,7 @@ if is_live_stream and active_video_path:
                 img_b64 = live_data.get("image_base64", "")
                 p_time = float(live_data.get("paused_time", 0.0))
                 
-                with st.spinner(f"📸 Extracting frame from paused moment ({p_time:.1f}s) & identifying..."):
+                with st.spinner(f"📸 Extracting frame from paused moment ({p_time:.1f}s) & identifying with Gemini AI..."):
                     f_rgb = None
                     
                     # 1. Primary: Exact frame captured on pause from browser video canvas
@@ -553,7 +333,7 @@ elif (not is_live_stream) and active_video_path and os.path.exists(active_video_
     st.markdown("""
     <div style='background: linear-gradient(135deg, rgba(99, 102, 241, 0.15) 0%, rgba(236, 72, 153, 0.15) 100%); border: 1px solid rgba(99, 102, 241, 0.35); border-radius: 12px; padding: 12px 18px; text-align: center; margin: 12px 0 16px 0;'>
         <span style='color: #a5b4fc; font-weight: 800;'>STEP 1:</span> Play or pause video when the person is on screen &nbsp;•&nbsp; 
-        <span style='color: #f472b6; font-weight: 800;'>STEP 2:</span> Click the glowing button below to identify them!
+        <span style='color: #f472b6; font-weight: 800;'>STEP 2:</span> Click the glowing button below to identify them with Gemini!
     </div>
     """, unsafe_allow_html=True)
 
@@ -566,37 +346,20 @@ elif (not is_live_stream) and active_video_path and os.path.exists(active_video_
                 ts = float(pause_data.get("timestamp", 0.0))
                 img_b64 = pause_data.get("image_base64", "")
                 
-                with st.spinner(f"📸 Extracting frame at {ts:.2f}s and recognizing with AI..."):
-                    f_rgb = None
-                    f_faces = []
-
-                    # 1. Primary: Exact frame captured directly from the browser's video canvas
-                    if img_b64 and "," in img_b64:
-                        try:
-                            raw_b64 = img_b64.split(",", 1)[1]
-                            nparr = np.frombuffer(base64.b64decode(raw_b64), np.uint8)
-                            f_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                            if f_bgr is not None:
-                                f_rgb = cv2.cvtColor(f_bgr, cv2.COLOR_BGR2RGB)
-                                f_faces = detect_faces_from_rgb(f_rgb)
-                        except Exception as decode_err:
-                            print(f"[Canvas Decode Error] {decode_err}")
-
-                    # 2. Secondary: If canvas capture was empty, extract via OpenCV VideoCapture
-                    if f_rgb is None:
-                        f_rgb, f_faces = extract_frame_at_timestamp(active_video_path, ts)
-
-                    # Ensure face detection is performed
-                    if f_rgb is not None and len(f_faces) == 0:
-                        f_faces = detect_faces_from_rgb(f_rgb)
+                with st.spinner(f"📸 Extracting frame at {ts:.2f}s and recognizing with Gemini AI..."):
+                    f_rgb, f_faces = extract_frame_at_timestamp(active_video_path, ts)
+                    
+                    if f_rgb is None and img_b64 and "," in img_b64:
+                        raw_b64 = img_b64.split(",", 1)[1]
+                        nparr = np.frombuffer(base64.b64decode(raw_b64), np.uint8)
+                        f_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        if f_bgr is not None:
+                            f_rgb = cv2.cvtColor(f_bgr, cv2.COLOR_BGR2RGB)
+                            f_faces = detect_faces_from_rgb(f_rgb)
 
                     if f_rgb is not None:
                         info = get_info(f_rgb, api_key=GEMINI_API_KEY, model=gemini_model)
                         p_name = extract_name(info)
-
-                        # If a person is identified but faces were not detected initially, run adaptive high-sensitivity pass
-                        if p_name != "Unknown" and len(f_faces) == 0:
-                            f_faces = detect_faces_from_rgb(f_rgb, high_sensitivity=True)
                         
                         st.session_state["v_info"] = info
                         st.session_state["v_name"] = p_name
@@ -617,13 +380,8 @@ elif (not is_live_stream) and active_video_path and os.path.exists(active_video_
                 with st.spinner(f"Extracting frame at {scrub_ts:.1f}s..."):
                     f_rgb, f_faces = extract_frame_at_timestamp(active_video_path, scrub_ts)
                     if f_rgb is not None:
-                        if len(f_faces) == 0:
-                            f_faces = detect_faces_from_rgb(f_rgb)
                         info = get_info(f_rgb, api_key=GEMINI_API_KEY, model=gemini_model)
                         p_name = extract_name(info)
-
-                        if p_name != "Unknown" and len(f_faces) == 0:
-                            f_faces = detect_faces_from_rgb(f_rgb, high_sensitivity=True)
                         
                         st.session_state["v_info"] = info
                         st.session_state["v_name"] = p_name
@@ -640,11 +398,6 @@ if st.session_state.get("v_name"):
     v_faces = st.session_state.get("v_faces", [])
     v_ts = st.session_state.get("v_ts", 0.0)
 
-    # If faces were not caught initially, run adaptive high-sensitivity pass
-    if len(v_faces) == 0 and v_frame is not None:
-        v_faces = detect_faces_from_rgb(v_frame, high_sensitivity=(v_name != "Unknown"))
-        st.session_state["v_faces"] = v_faces
-
     st.markdown("---")
     if v_name != "Unknown":
         st.success(f"### 👤 Person Identified: **{v_name}**")
@@ -653,24 +406,12 @@ if st.session_state.get("v_name"):
 
     col_res1, col_res2 = st.columns([1, 1])
     with col_res1:
-        # Only draw bounding boxes on real detected faces; if no faces found, show original frame
         if len(v_faces) > 0:
             annotated_frame = draw_faces(v_frame, v_faces, v_name)
-            st.image(annotated_frame, caption=f"Detected Face at {v_ts:.1f}s (with Bounding Box)", use_container_width=True)
+            st.image(annotated_frame, caption=f"Detected Face at {v_ts:.1f}s", use_container_width=True)
         else:
             st.image(v_frame, caption=f"Captured Frame at {v_ts:.1f}s", use_container_width=True)
 
     with col_res2:
-        st.markdown("""
-        <div style="background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 12px; padding: 18px 22px; margin-bottom: 12px;">
-            <h4 style="margin-top: 0; color: #a5b4fc; display: flex; align-items: center; gap: 8px;">
-                <span>📋</span> AI Intelligence Dossier
-            </h4>
-        </div>
-        """, unsafe_allow_html=True)
-        if v_name != "Unknown":
-            st.markdown(v_info)
-        else:
-            st.info("ℹ️ **No Confirmed Celebrity Identified in this Frame.**\n\nThe AI could not verify an internationally recognized public figure in this specific frame. To get an accurate identification:\n- Pause at a moment where the person's face is clearly visible, in focus, and facing the camera.\n- Avoid moments with rapid motion blur or heavy backlighting.")
-
-
+        st.markdown("#### 📋 Gemini Intelligence Dossier")
+        st.markdown(v_info)

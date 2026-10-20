@@ -76,8 +76,7 @@
         }
 
         function setFrameHeight(h) {
-            const desiredHeight = h || Math.max(84, document.body.scrollHeight || 84);
-            sendMessageToStreamlit("streamlit:setFrameHeight", { height: desiredHeight });
+            sendMessageToStreamlit("streamlit:setFrameHeight", { height: h || 62 });
         }
 
         function setComponentValue(val) {
@@ -86,15 +85,14 @@
 
         window.addEventListener("DOMContentLoaded", function() {
             setComponentReady();
-            setFrameHeight(84);
+            setFrameHeight(62);
         });
 
         window.addEventListener("message", function(e) {
             if (e.data && e.data.type === "streamlit:render") {
-                setFrameHeight(84);
+                setFrameHeight(62);
             }
         });
-
 
         function onCaptureClick() {
             let pausedTime = 0.0;

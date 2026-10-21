@@ -194,10 +194,27 @@ def detect_faces_from_rgb(img_rgb, high_sensitivity=False):
     return non_max_suppression(candidate_boxes, overlap_thresh=0.35)
 
 
+def crop_face_region(image_rgb, box, pad_ratio=0.25):
+    """Crops the primary detected face with safe padding to include hair and jawline."""
+    if image_rgb is None or box is None:
+        return None
+    ih, iw = image_rgb.shape[:2]
+    x, y, w, h = box
+    pad_x = int(w * pad_ratio)
+    pad_y = int(h * pad_ratio)
+    x1 = max(0, x - pad_x)
+    y1 = max(0, y - pad_y)
+    x2 = min(iw, x + w + pad_x)
+    y2 = min(ih, y + h + pad_y)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return image_rgb[y1:y2, x1:x2]
+
+
 def draw_faces(image, faces, celebrity_name):
     """Draws sleek bounding boxes and prominent badges around detected faces."""
     annotated = image.copy()
-    display_label = celebrity_name if celebrity_name and celebrity_name != "Unknown" else "Identified Celebrity"
+    display_label = celebrity_name if (celebrity_name and celebrity_name != "Unknown") else "Face Detected"
     
     for (x, y, w, h) in faces:
         # 1. Main bounding box (Vibrant Emerald / Cyan)
@@ -263,91 +280,130 @@ def extract_frame_at_timestamp(video_path, timestamp_seconds):
 
 
 def extract_name(content):
-    """Parses the real celebrity / person full name from Gemini response."""
+    """Parses the real celebrity / person full name from Gemini response with strict validation."""
     if not content or content.strip() in ["Unknown", ""]:
         return "Unknown"
+        
+    first_line = content.strip().splitlines()[0].strip()
+    if first_line.lower() in ["unknown", "**unknown**", "unknown.", "- unknown", "- **full name**: unknown"]:
+        return "Unknown"
+
+    bad_terms = ["unknown", "n/a", "none", "unidentified", "unrecognized", "masked", "not identified", "cannot identify"]
+
     for line in content.splitlines():
         clean = line.strip()
         if clean.lower().startswith("- **full name**:") or clean.lower().startswith("**full name**:"):
             parts = clean.split(":", 1)
             if len(parts) > 1:
                 name = parts[1].strip(" *\"'()[]")
-                if name and name.lower() not in ["unknown", "n/a", "none"]:
+                if name and not any(bad in name.lower() for bad in bad_terms):
                     return name
         elif clean.lower().startswith("full name:"):
             parts = clean.split(":", 1)
             if len(parts) > 1:
                 name = parts[1].strip(" *\"'()[]")
-                if name and name.lower() not in ["unknown", "n/a", "none"]:
+                if name and not any(bad in name.lower() for bad in bad_terms):
                     return name
     return "Unknown"
 
-def get_info(image_data, api_key=None, model=None):
-    """Sends image to Gemini API with fast payload optimization and Google Knowledge Graph / AI Overview depth."""
-    # Convert image_data into base64 and optimize resolution for fast network transport
-    if isinstance(image_data, str) and os.path.exists(image_data):
-        img_bgr = cv2.imread(image_data)
-        if img_bgr is not None:
-            image_data = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        else:
-            with open(image_data, "rb") as img_file:
-                img_base64 = base64.b64encode(img_file.read()).decode()
 
-    if isinstance(image_data, np.ndarray):
-        h, w = image_data.shape[:2]
-        # Optimize image size for Vision AI (max 768px keeps details crisp while speeding up inference 10x)
-        scale = min(1.0, 768.0 / max(h, w))
-        if scale < 1.0:
-            small_rgb = cv2.resize(image_data, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+def to_jpeg_base64(img_data, max_dim=768, quality=85):
+    """Converts numpy RGB image, filepath, or bytes into an optimized JPEG base64 string."""
+    if img_data is None:
+        return None
+    if isinstance(img_data, str) and os.path.exists(img_data):
+        bgr = cv2.imread(img_data)
+        if bgr is not None:
+            img_data = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         else:
-            small_rgb = image_data
-        _, buffer = cv2.imencode('.jpg', cv2.cvtColor(small_rgb, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        img_base64 = base64.b64encode(buffer).decode()
-    elif isinstance(image_data, (bytes, bytearray)):
-        img_base64 = base64.b64encode(image_data).decode()
-    elif isinstance(image_data, str) and not os.path.exists(image_data):
-        img_base64 = image_data
-    else:
+            with open(img_data, "rb") as f:
+                return base64.b64encode(f.read()).decode()
+    if isinstance(img_data, np.ndarray):
+        h, w = img_data.shape[:2]
+        scale = min(1.0, float(max_dim) / max(h, w))
+        if scale < 1.0:
+            target = cv2.resize(img_data, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        else:
+            target = img_data
+        _, buf = cv2.imencode('.jpg', cv2.cvtColor(target, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        return base64.b64encode(buf).decode()
+    if isinstance(img_data, (bytes, bytearray)):
+        return base64.b64encode(img_data).decode()
+    if isinstance(img_data, str) and not os.path.exists(img_data):
+        return img_data
+    return None
+
+
+def get_info(image_data, face_crop=None, api_key=None, model=None):
+    """Sends face crop and full frame to Gemini API with strict 4-Gate anti-hallucination verification."""
+    full_b64 = to_jpeg_base64(image_data, max_dim=768, quality=85)
+    crop_b64 = to_jpeg_base64(face_crop, max_dim=512, quality=90) if face_crop is not None else None
+
+    if not full_b64 and not crop_b64:
         return "Unknown"
 
-    prompt_text = """You are an elite, authoritative AI intelligence system trained in identifying real celebrities, actors, actresses, and notable public figures with Google Knowledge Graph / AI Overview accuracy.
+    prompt_text = """You are an elite, authoritative AI facial recognition intelligence system with Google Knowledge Graph / AI Overview accuracy.
 
-CRITICAL ACCURACY & GROUNDING RULES:
-1. Examine the image carefully. You must ONLY identify the person if you recognize them as a real, globally known public figure / celebrity with HIGH CONFIDENCE based on their facial features.
-2. If the face is unclear, in heavy motion blur, an ordinary person/background extra, or if you are not 100% sure of their identity, you MUST strictly respond with "Unknown".
-3. Do NOT guess, hallucinate, or assume a celebrity based on clothing, background, or objects.
-4. If the image depicts background scenery, inanimate objects, or has no clear human face, respond strictly with "Unknown".
-5. When a recognized celebrity is verified, output the intelligence dossier in this exact structured format:
+CRITICAL MANDATORY GATES (EVALUATE IN EXACT ORDER):
 
+GATE 1: MASK & OCCLUSION CHECK (ZERO TOLERANCE)
+- Carefully inspect the primary person's face (especially in the close-up crop if provided).
+- Is the person wearing a medical face mask, surgical mask, cloth mask, bandana, or is their nose and/or mouth covered or occluded?
+- IF THE NOSE AND/OR MOUTH IS COVERED BY A MASK OR CLOTH: YOU MUST STRICTLY RESPOND WITH 'Unknown'.
+- Never guess or attempt identification from hair, clothing, scrubs, uniforms, or setting when the face is masked or occluded.
+
+GATE 2: BIOLOGICAL SEX & GENDER INTEGRITY (ZERO TOLERANCE)
+- Determine the biological sex / gender presentation of the face.
+- If the person has a female face, NEVER identify them as a male celebrity or assign a male name.
+- If the person has a male face, NEVER identify them as a female celebrity or assign a female name.
+- Any gender ambiguity or mismatch MUST immediately result in 'Unknown'.
+
+GATE 3: STRICT FACIAL RECOGNITION (ANTI-HALLUCINATION)
+- You must ONLY identify the person if you recognize their facial features (eyes, eyebrows, nose, mouth, jawline) with 100% confidence as an internationally recognized celebrity or public figure.
+- If this is an ordinary individual, background extra, or unconfirmed person, respond strictly with 'Unknown'.
+- Do NOT guess based on movie theme, costumes, doctor attire, or background scenery.
+
+GATE 4: ACCURACY OF INTELLIGENCE DOSSIER
+- All facts, records, awards, and filmography must strictly belong to the verified person with 100% factual accuracy.
+
+OUTPUT FORMAT:
+If ANY gate fails or no celebrity is recognized with certainty, respond strictly with:
+Unknown
+
+When verified with 100% certainty, output in this exact structured format:
 - **Full Name**: <Person's Official Full Name>
-- **Profession**: <All primary professions, creative domains, and titles, e.g., Actress and singer>
-- **Nationality**: <Country of origin / nationality>
-- **Claim to Fame**: <A comprehensive summary of why they are globally famous, their historical impact, records, or unique standing in culture/cinema>
+- **Gender**: <Female or Male>
+- **Profession**: <All primary professions and domains>
+- **Nationality**: <Country of origin>
+- **Claim to Fame**: <Comprehensive summary of their global standing and career impact>
 
 ### 🏆 Key Achievements & Major Awards
-- **Records & Milestones**: <Specific historic records, milestones, or distinctions (e.g., holding the record of winning five César Awards for Best Actress — more than any other actor in history)>
-- **Major Awards & Nominations**: <Detailed list of major awards such as Academy Award (Oscar) nominations, César Awards, BAFTA, Cannes Film Festival Best Actress/Actor, Berlin Silver Bear, Golden Globes, with years and categories>
+- **Records & Milestones**: <Factual historic records or major milestones>
+- **Major Awards & Nominations**: <Detailed list of major awards such as Oscars, César Awards, BAFTA, Cannes, etc.>
 
 ### 🎬 Notable Works & Landmark Roles
-- <List 4-6 landmark films, series, musical releases, or career-defining performances with release years and their critical or box office significance>
+- <4-6 landmark films, series, or works with release years>
 
 ### 📖 Biographical & Career Overview
-<A detailed, insightful 1-2 paragraph biography summarizing their career trajectory, artistic impact, cultural legacy, and notable milestones.>
-
-If no famous person is recognized with certainty, respond strictly with "Unknown".
+<A detailed 1-2 paragraph biography summarizing their career trajectory, artistic impact, and notable milestones.>
 """
 
     key = api_key or GEMINI_API_KEY or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    req_model = model or gemini_model or "gemini-3.1-flash-lite"
+    req_model = model or gemini_model or "gemini-3.5-flash-lite"
     
+    parts = [{"text": prompt_text}]
+    if crop_b64:
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": crop_b64}})
+    if full_b64:
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": full_b64}})
+
     if key:
-        # Prioritize modern, high-availability Gemini endpoints
         models_to_try = [
             req_model,
-            "gemini-3.1-flash-lite",
             "gemini-3.5-flash-lite",
+            "gemini-3-flash-preview",
+            "gemini-3.1-flash-lite",
             "gemini-3.5-flash",
-            "gemini-3.8-flash",
             "gemini-flash-latest"
         ]
         seen = set()
@@ -358,25 +414,20 @@ If no famous person is recognized with certainty, respond strictly with "Unknown
                 clean_mod = mod.replace("models/", "")
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{clean_mod}:generateContent?key={key}"
                 payload = {
-                    "contents": [{
-                        "parts": [
-                            {"text": prompt_text},
-                            {"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}
-                        ]
-                    }],
+                    "contents": [{"parts": parts}],
                     "generationConfig": {
                         "temperature": 0.1,
                         "maxOutputTokens": 2048
                     }
                 }
-                response = requests.post(url, json=payload, timeout=25.0)
+                response = requests.post(url, json=payload, timeout=30.0)
                 if response.status_code == 200:
                     data = response.json()
                     candidates = data.get("candidates", [])
                     if candidates:
-                        parts = candidates[0].get("content", {}).get("parts", [])
-                        if parts and "text" in parts[0]:
-                            ans = parts[0]["text"].strip()
+                        content_parts = candidates[0].get("content", {}).get("parts", [])
+                        if content_parts and "text" in content_parts[0]:
+                            ans = content_parts[0]["text"].strip()
                             if ans:
                                 return ans
                 elif response.status_code in [404, 503, 429]:
@@ -392,6 +443,7 @@ If no famous person is recognized with certainty, respond strictly with "Unknown
     groq_key = os.getenv("GROQ_API_KEY")
     if groq_key:
         headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
+        primary_b64 = crop_b64 or full_b64
         payload = {
             "model": "qwen/qwen3.8-27b",
             "messages": [
@@ -399,7 +451,7 @@ If no famous person is recognized with certainty, respond strictly with "Unknown
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt_text},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}}
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{primary_b64}"}}
                     ]
                 }
             ],
@@ -519,7 +571,12 @@ if is_live_stream and active_video_path:
 
                     if f_rgb is not None:
                         f_faces = detect_faces_from_rgb(f_rgb)
-                        info = get_info(f_rgb, api_key=GEMINI_API_KEY, model=gemini_model)
+                        face_crop = None
+                        if f_faces and len(f_faces) > 0:
+                            largest = max(f_faces, key=lambda b: b[2] * b[3])
+                            face_crop = crop_face_region(f_rgb, largest)
+
+                        info = get_info(f_rgb, face_crop=face_crop, api_key=GEMINI_API_KEY, model=gemini_model)
                         p_name = extract_name(info)
 
                         st.session_state["v_info"] = info
@@ -590,7 +647,12 @@ elif (not is_live_stream) and active_video_path and os.path.exists(active_video_
                         f_faces = detect_faces_from_rgb(f_rgb)
 
                     if f_rgb is not None:
-                        info = get_info(f_rgb, api_key=GEMINI_API_KEY, model=gemini_model)
+                        face_crop = None
+                        if f_faces and len(f_faces) > 0:
+                            largest = max(f_faces, key=lambda b: b[2] * b[3])
+                            face_crop = crop_face_region(f_rgb, largest)
+
+                        info = get_info(f_rgb, face_crop=face_crop, api_key=GEMINI_API_KEY, model=gemini_model)
                         p_name = extract_name(info)
 
                         # If a person is identified but faces were not detected initially, run adaptive high-sensitivity pass
@@ -618,7 +680,12 @@ elif (not is_live_stream) and active_video_path and os.path.exists(active_video_
                     if f_rgb is not None:
                         if len(f_faces) == 0:
                             f_faces = detect_faces_from_rgb(f_rgb)
-                        info = get_info(f_rgb, api_key=GEMINI_API_KEY, model=gemini_model)
+                        face_crop = None
+                        if f_faces and len(f_faces) > 0:
+                            largest = max(f_faces, key=lambda b: b[2] * b[3])
+                            face_crop = crop_face_region(f_rgb, largest)
+
+                        info = get_info(f_rgb, face_crop=face_crop, api_key=GEMINI_API_KEY, model=gemini_model)
                         p_name = extract_name(info)
 
                         if p_name != "Unknown" and len(f_faces) == 0:
@@ -648,7 +715,7 @@ if st.session_state.get("v_name"):
     if v_name != "Unknown":
         st.success(f"### 👤 Person Identified: **{v_name}**")
     else:
-        st.warning("### 👤 Person: Unknown / Unrecognized")
+        st.warning("### 👤 Person: Unrecognized / Masked / No Celebrity Match")
 
     col_res1, col_res2 = st.columns([1, 1])
     with col_res1:
@@ -670,5 +737,10 @@ if st.session_state.get("v_name"):
         if v_name != "Unknown":
             st.markdown(v_info)
         else:
-            st.info("ℹ️ **No Confirmed Celebrity Identified in this Frame.**\n\nThe AI could not verify an internationally recognized public figure in this specific frame. To get an accurate identification:\n- Pause at a moment where the person's face is clearly visible, in focus, and facing the camera.\n- Avoid moments with rapid motion blur or heavy backlighting.")
+            st.info("""ℹ️ **No Confirmed Celebrity Identified in this Frame.**
+
+The AI verification system adheres to strict accuracy and anti-hallucination standards:
+- **Mask / Occlusion Policy:** When a face is covered by a medical or cloth mask, identification is strictly withheld because the facial features cannot be validated.
+- **Gender & Identity Verification:** Only verified public figures with clear, unobstructed facial features and gender consistency are identified.
+- **Tip for Best Results:** Pause at a moment where the person's face is clearly visible, facing the camera, unmasked, and in focus.""")
 

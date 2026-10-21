@@ -145,7 +145,7 @@
         }
 
         function setFrameHeight(h) {
-            let target = h || document.body.scrollHeight || 580;
+            let target = h || (document.body.scrollHeight ? document.body.scrollHeight + 24 : 600);
             if (Math.abs(target - lastHeight) > 4) {
                 lastHeight = target;
                 sendMessageToStreamlit("streamlit:setFrameHeight", { height: target });

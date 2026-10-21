@@ -5,18 +5,20 @@
     <style>
         body {
             margin: 0;
-            padding: 4px 0;
+            padding: 8px 0;
             background: transparent;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             display: flex;
             justify-content: center;
             align-items: center;
+            box-sizing: border-box;
+            overflow: hidden;
         }
         .btn-detect {
             background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 50%, #db2777 100%);
             color: #ffffff;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            padding: 15px 36px;
+            border: 1px solid rgba(255, 255, 255, 0.25);
+            padding: 13px 32px;
             font-size: 1.02rem;
             font-weight: 800;
             border-radius: 9999px;
@@ -32,7 +34,7 @@
             text-transform: uppercase;
             letter-spacing: 1px;
             position: relative;
-            overflow: hidden;
+            box-sizing: border-box;
         }
         .btn-detect:hover {
             transform: translateY(-2px) scale(1.02);
@@ -76,7 +78,7 @@
         }
 
         function setFrameHeight(h) {
-            const desiredHeight = h || Math.max(84, document.body.scrollHeight || 84);
+            const desiredHeight = h || 96;
             sendMessageToStreamlit("streamlit:setFrameHeight", { height: desiredHeight });
         }
 
@@ -86,12 +88,12 @@
 
         window.addEventListener("DOMContentLoaded", function() {
             setComponentReady();
-            setFrameHeight(84);
+            setFrameHeight(96);
         });
 
         window.addEventListener("message", function(e) {
             if (e.data && e.data.type === "streamlit:render") {
-                setFrameHeight(84);
+                setFrameHeight(96);
             }
         });
 

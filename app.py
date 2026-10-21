@@ -28,7 +28,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Hide Streamlit sidebar completely via CSS
+# Hide Streamlit sidebar and constrain video player size
 st.markdown("""
 <style>
     [data-testid="stSidebar"], section[data-testid="stSidebar"] {
@@ -36,6 +36,23 @@ st.markdown("""
     }
     [data-testid="collapsedControl"] {
         display: none !important;
+    }
+    
+    /* Neatly constrain video player size so uploaded videos never take full screen */
+    [data-testid="stVideo"] {
+        max-width: 680px !important;
+        margin-left: auto !important;
+        margin-right: auto !important;
+        display: flex !important;
+        justify-content: center !important;
+    }
+    [data-testid="stVideo"] video {
+        max-height: 440px !important;
+        max-width: 100% !important;
+        object-fit: contain !important;
+        border-radius: 14px !important;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5) !important;
+        background: #000 !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -871,8 +888,10 @@ elif (not is_live_stream) and active_video_path and os.path.exists(active_video_
     secs = int(duration % 60)
     st.info(f"📹 **Video:** `{os.path.basename(active_video_path)}` | ⏱️ **Duration:** `{mins:02d}:{secs:02d}` ({duration:.1f}s)")
 
-    # Render Video Player
-    st.video(active_video_path)
+    # Render Video Player in centered, compact container
+    col_vpad1, col_vplayer, col_vpad2 = st.columns([1, 4, 1])
+    with col_vplayer:
+        st.video(active_video_path)
 
     # Instructions banner
     st.markdown("""

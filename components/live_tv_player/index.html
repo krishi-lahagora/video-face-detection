@@ -7,14 +7,15 @@
         * { box-sizing: border-box; }
         body {
             margin: 0;
-            padding: 8px 0;
+            padding: 8px 12px 40px 12px;
             background: transparent;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
             color: #f1f5f9;
             display: flex;
             flex-direction: column;
             align-items: center;
-            overflow-x: hidden;
+            overflow: hidden;
+            box-sizing: border-box;
         }
         .player-wrapper {
             width: 100%;
@@ -22,8 +23,7 @@
             background: #000;
             border-radius: 14px;
             overflow: hidden;
-            box-shadow: 0 8px 30px rgba(0,0,0,0.6);
-            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 10px 35px rgba(0,0,0,0.75), 0 0 0 1px rgba(255, 255, 255, 0.1);
             position: relative;
             aspect-ratio: 16 / 9;
             min-height: 250px;
@@ -38,59 +38,71 @@
         .controls-bar {
             width: 100%;
             max-width: 820px;
-            margin-top: 14px;
+            margin-top: 20px;
             display: flex;
             flex-direction: column;
-            gap: 12px;
+            gap: 16px;
             align-items: center;
+            box-sizing: border-box;
         }
         .status-badge {
             font-size: 0.88rem;
             font-weight: 700;
-            padding: 8px 20px;
+            padding: 8px 24px;
             border-radius: 9999px;
             display: inline-flex;
             align-items: center;
             gap: 10px;
             transition: all 0.3s ease;
+            box-sizing: border-box;
+            backdrop-filter: blur(8px);
         }
         .status-live {
-            color: #ef4444;
-            border: 1px solid rgba(239, 68, 68, 0.4);
-            background: rgba(239, 68, 68, 0.12);
+            color: #ff4d4f;
+            border: 1px solid rgba(255, 77, 79, 0.45);
+            background: rgba(255, 77, 79, 0.12);
+            box-shadow: 0 2px 14px rgba(255, 77, 79, 0.2);
         }
         .status-paused {
             color: #38bdf8;
-            border: 1px solid rgba(56, 189, 248, 0.5);
-            background: rgba(56, 189, 248, 0.15);
-            box-shadow: 0 0 15px rgba(56, 189, 248, 0.25);
+            border: 1px solid rgba(56, 189, 248, 0.55);
+            background: rgba(56, 189, 248, 0.16);
+            box-shadow: 0 0 20px rgba(56, 189, 248, 0.3);
         }
         .btn-detect {
             background: linear-gradient(135deg, #ef4444 0%, #dc2626 50%, #b91c1c 100%);
             color: #ffffff;
-            border: 1px solid rgba(255, 255, 255, 0.25);
+            border: 1px solid rgba(255, 255, 255, 0.32);
             padding: 15px 36px;
-            font-size: 1.05rem;
+            font-size: 1.02rem;
             font-weight: 800;
             border-radius: 9999px;
             cursor: pointer;
-            box-shadow: 0 4px 25px rgba(239, 68, 68, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+            box-shadow: 0 8px 26px rgba(239, 68, 68, 0.45), 0 2px 6px rgba(0, 0, 0, 0.3), inset 0 1px 1px rgba(255, 255, 255, 0.4);
             transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-            display: flex;
+            display: inline-flex;
             align-items: center;
-            gap: 10px;
-            width: 100%;
+            gap: 12px;
+            width: auto;
+            min-width: 380px;
+            max-width: 560px;
             justify-content: center;
             text-transform: uppercase;
-            letter-spacing: 0.5px;
+            letter-spacing: 0.8px;
+            position: relative;
+            box-sizing: border-box;
+            user-select: none;
+            outline: none;
         }
         .btn-detect:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 32px rgba(239, 68, 68, 0.7);
+            transform: translateY(-2px) scale(1.018);
+            box-shadow: 0 12px 34px rgba(239, 68, 68, 0.65), 0 4px 10px rgba(0, 0, 0, 0.35), inset 0 1px 1px rgba(255, 255, 255, 0.55);
             background: linear-gradient(135deg, #f87171 0%, #ef4444 50%, #dc2626 100%);
+            border-color: rgba(255, 255, 255, 0.45);
         }
         .btn-detect:active {
-            transform: translateY(1px);
+            transform: translateY(1px) scale(0.985);
+            box-shadow: 0 4px 14px rgba(239, 68, 68, 0.4), inset 0 1px 2px rgba(0, 0, 0, 0.3);
         }
         .pulse-dot {
             width: 10px;
@@ -144,12 +156,20 @@
             sendMessageToStreamlit("streamlit:componentReady", { apiVersion: 1 });
         }
 
-        function setFrameHeight(h) {
-            let target = h || (document.body.scrollHeight ? document.body.scrollHeight + 24 : 600);
-            if (Math.abs(target - lastHeight) > 4) {
+        function updateFrameHeight(h) {
+            let scrollH = document.body.scrollHeight || document.documentElement.scrollHeight || 0;
+            let offsetH = document.body.offsetHeight || 0;
+            let measured = Math.max(scrollH, offsetH);
+            let target = h || (measured ? measured + 28 : 650);
+            if (target < 650) target = 650;
+            if (Math.abs(target - lastHeight) >= 2) {
                 lastHeight = target;
                 sendMessageToStreamlit("streamlit:setFrameHeight", { height: target });
             }
+        }
+
+        function setFrameHeight(h) {
+            updateFrameHeight(h);
         }
 
         function setComponentValue(val) {
@@ -225,6 +245,7 @@
             statusDot.style.boxShadow = "0 0 10px #ef4444";
             statusText.innerText = "🔴 Live TV Playing — Pause video anytime to capture actor!";
             btnText.innerText = "Pause & Detect Person from Live TV";
+            updateFrameHeight();
         });
 
         vid.addEventListener("pause", function() {
@@ -234,6 +255,7 @@
             let pTime = (vid.currentTime || 0).toFixed(1);
             statusText.innerText = "⏸️ PAUSED at " + pTime + "s — Ready to Capture & Detect!";
             btnText.innerText = "🎯 Detect Person from This Paused Frame";
+            updateFrameHeight();
         });
 
         function onDetectClick() {
@@ -262,9 +284,20 @@
             });
         }
 
+        if (window.ResizeObserver) {
+            let ro = new ResizeObserver(function() {
+                updateFrameHeight();
+            });
+            ro.observe(document.body);
+        }
+
         window.addEventListener("DOMContentLoaded", function() {
             setComponentReady();
-            setFrameHeight(580);
+            updateFrameHeight();
+        });
+
+        window.addEventListener("load", function() {
+            updateFrameHeight();
         });
 
         window.addEventListener("message", function(e) {
@@ -273,7 +306,8 @@
                 if (args.stream_url) {
                     initStream(args.stream_url);
                 }
-                setFrameHeight(580);
+                setTimeout(updateFrameHeight, 50);
+                setTimeout(updateFrameHeight, 300);
             }
         });
     </script>

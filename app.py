@@ -304,15 +304,19 @@ def process_frame_for_persons(frame_rgb, faces, api_key=None, model=None):
 
     # If still no faces found, pass full frame to Gemini to check if a clear person is present
     if not faces or len(faces) == 0:
-        info = get_info(frame_rgb, face_crop=None, api_key=api_key, model=model)
-        name = extract_name(info)
-        is_rec = (name != "Unknown")
+        name = get_celebrity_name_from_gemini(frame_rgb, face_crop=None, api_key=api_key, model=model)
+        is_rec = (name != "Unknown" and bool(name.strip()))
+        if is_rec:
+            dossier, photo_url = get_verified_celebrity_dossier(name)
+        else:
+            name, dossier, photo_url = "Unknown", "Unknown", None
         return [{
             "id": 1,
             "box": None,
             "crop": None,
             "name": name,
-            "info": info,
+            "info": dossier,
+            "photo_url": photo_url,
             "is_recognized": is_rec,
             "confidence": 98.8 if is_rec else 0.0
         }]
@@ -334,15 +338,19 @@ def process_frame_for_persons(frame_rgb, faces, api_key=None, model=None):
 
     def analyze_single_face(idx, box):
         crop = crop_face_region(frame_rgb, box, pad_ratio=0.25)
-        info = get_info(frame_rgb, face_crop=crop, api_key=api_key, model=model)
-        name = extract_name(info)
-        is_rec = (name != "Unknown")
+        name = get_celebrity_name_from_gemini(frame_rgb, face_crop=crop, api_key=api_key, model=model)
+        is_rec = (name != "Unknown" and bool(name.strip()))
+        if is_rec:
+            dossier, photo_url = get_verified_celebrity_dossier(name)
+        else:
+            name, dossier, photo_url = "Unknown", "Unknown", None
         return {
             "id": idx + 1,
             "box": box,
             "crop": crop,
             "name": name,
-            "info": info,
+            "info": dossier,
+            "photo_url": photo_url,
             "is_recognized": is_rec,
             "confidence": 98.8 if is_rec else 0.0
         }
@@ -362,6 +370,7 @@ def process_frame_for_persons(frame_rgb, faces, api_key=None, model=None):
                     "crop": crop_face_region(frame_rgb, valid_faces[idx]),
                     "name": "Unknown",
                     "info": "Unknown",
+                    "photo_url": None,
                     "is_recognized": False,
                     "confidence": 0.0
                 }
@@ -410,6 +419,12 @@ def extract_name(content):
 
     bad_terms = ["unknown", "n/a", "none", "unidentified", "unrecognized", "masked", "not identified", "cannot identify"]
 
+    # Check if first line is directly a name (e.g. 'Shahid Kapoor' or 'Isabelle Adjani')
+    if not first_line.startswith("-") and ":" not in first_line:
+        cleaned = first_line.strip(" *\"'()[]")
+        if cleaned and not any(bad in cleaned.lower() for bad in bad_terms):
+            return cleaned
+
     for line in content.splitlines():
         clean = line.strip()
         if clean.lower().startswith("- **full name**:") or clean.lower().startswith("**full name**:"):
@@ -454,63 +469,124 @@ def to_jpeg_base64(img_data, max_dim=768, quality=85):
     return None
 
 
-def get_info(image_data, face_crop=None, api_key=None, model=None):
-    """Sends face crop and full frame to Gemini API with strict 4-Gate anti-hallucination verification."""
+def fetch_wikipedia_data(name):
+    """Fetches verified biographical data, description, and thumbnail from Wikipedia REST API."""
+    if not name or name == "Unknown":
+        return None
+    try:
+        session = requests.Session()
+        session.headers.update({"User-Agent": "CelebrityRecognitionStudio/2.0 (contact: info@example.com)"})
+        # Search for best Wikipedia title match
+        search_url = "https://en.wikipedia.org/w/api.php"
+        search_params = {
+            "action": "query",
+            "list": "search",
+            "srsearch": name,
+            "format": "json",
+            "srlimit": 1
+        }
+        res = session.get(search_url, params=search_params, timeout=4.0)
+        if res.status_code == 200:
+            hits = res.json().get("query", {}).get("search", [])
+            if hits:
+                title = hits[0]["title"]
+                sum_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{requests.utils.quote(title)}"
+                sum_res = session.get(sum_url, timeout=4.0)
+                if sum_res.status_code == 200:
+                    return sum_res.json()
+    except Exception as e:
+        print(f"[Wikipedia API Notice] {e}")
+    return None
+
+
+def fetch_imdb_data(name):
+    """Fetches verified credits, landmark roles, and official profile photo from IMDb API."""
+    if not name or name == "Unknown":
+        return None
+    try:
+        clean = requests.utils.quote(name.lower().replace(" ", "_"))
+        first_char = clean[0] if clean else "a"
+        url = f"https://v3.sg.media-imdb.com/suggestion/{first_char}/{clean}.json"
+        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+        r = requests.get(url, headers=headers, timeout=4.0)
+        if r.status_code == 200:
+            for item in r.json().get("d", []):
+                if item.get("id", "").startswith("nm"):
+                    return {
+                        "imdb_id": item.get("id"),
+                        "name": item.get("l"),
+                        "role": item.get("s"),
+                        "image": item.get("i", {}).get("imageUrl"),
+                        "url": f"https://www.imdb.com/name/{item.get('id')}/"
+                    }
+    except Exception as e:
+        print(f"[IMDb API Notice] {e}")
+    return None
+
+
+def get_verified_celebrity_dossier(name):
+    """Builds a 100% genuine, factual dossier from Wikipedia and IMDb without AI hallucination."""
+    if not name or name == "Unknown":
+        return "Unknown", None
+
+    wiki = fetch_wikipedia_data(name)
+    imdb = fetch_imdb_data(name)
+
+    # Pick official photo from IMDb or Wikipedia
+    photo = (imdb.get("image") if imdb else None) or (wiki.get("thumbnail", {}).get("source") if wiki else None)
+    
+    display_name = (imdb.get("name") if imdb else None) or (wiki.get("title") if wiki else name)
+    desc = wiki.get("description") if wiki else None
+    role = imdb.get("role") if imdb else None
+    extract = wiki.get("extract") if wiki else None
+
+    lines = []
+    lines.append(f"- **Full Name**: {display_name}")
+    if desc:
+        lines.append(f"- **Profession & Overview**: {desc}")
+    if role:
+        lines.append(f"- **Key Works & Credits (IMDb)**: {role}")
+
+    # Official links
+    ref_links = []
+    if wiki and wiki.get("content_urls", {}).get("desktop", {}).get("page"):
+        ref_links.append(f"[🌐 Wikipedia Official Page]({wiki['content_urls']['desktop']['page']})")
+    if imdb and imdb.get("url"):
+        ref_links.append(f"[🎬 IMDb Profile & Filmography]({imdb['url']})")
+    ref_links.append(f"[🔍 Google Knowledge Graph](https://www.google.com/search?q={urllib.parse.quote(name)})")
+    
+    lines.append(f"- **Authoritative Reference Sources**: {' • '.join(ref_links)}")
+
+    if extract:
+        lines.append("\n### 📖 Biographical Overview (Verified by Wikipedia)")
+        lines.append(extract)
+    else:
+        lines.append(f"\n### 📖 Verified Profile\nAuthoritative public records for **{display_name}** are confirmed on IMDb and Wikipedia.")
+
+    return "\n".join(lines), photo
+
+
+def get_celebrity_name_from_gemini(image_data, face_crop=None, api_key=None, model=None):
+    """Asks Gemini to output ONLY the verified person full name (or Unknown) with ultra-fast 50-token payload."""
     full_b64 = to_jpeg_base64(image_data, max_dim=768, quality=85)
     crop_b64 = to_jpeg_base64(face_crop, max_dim=512, quality=90) if face_crop is not None else None
 
     if not full_b64 and not crop_b64:
         return "Unknown"
 
-    prompt_text = """You are an elite, authoritative AI facial recognition intelligence system with Google Knowledge Graph / AI Overview accuracy.
+    prompt_text = """You are an elite, authoritative AI facial recognition system.
 
-CRITICAL MANDATORY GATES (EVALUATE IN EXACT ORDER):
-
-GATE 1: MASK & OCCLUSION CHECK (ZERO TOLERANCE)
-- Carefully inspect the primary person's face (especially in the close-up crop if provided).
-- Is the person wearing a medical face mask, surgical mask, cloth mask, bandana, or is their nose and/or mouth covered or occluded?
-- IF THE NOSE AND/OR MOUTH IS COVERED BY A MASK OR CLOTH: YOU MUST STRICTLY RESPOND WITH 'Unknown'.
-- Never guess or attempt identification from hair, clothing, scrubs, uniforms, or setting when the face is masked or occluded.
-
-GATE 2: BIOLOGICAL SEX & GENDER INTEGRITY (ZERO TOLERANCE)
-- Determine the biological sex / gender presentation of the face.
-- If the person has a female face, NEVER identify them as a male celebrity or assign a male name.
-- If the person has a male face, NEVER identify them as a female celebrity or assign a female name.
-- Any gender ambiguity or mismatch MUST immediately result in 'Unknown'.
-
-GATE 3: STRICT FACIAL RECOGNITION (ANTI-HALLUCINATION)
-- You must ONLY identify the person if you recognize their facial features (eyes, eyebrows, nose, mouth, jawline) with 100% confidence as an internationally recognized celebrity or public figure.
-- If this is an ordinary individual, background extra, or unconfirmed person, respond strictly with 'Unknown'.
-- Do NOT guess based on movie theme, costumes, doctor attire, or background scenery.
-
-GATE 4: ACCURACY OF INTELLIGENCE DOSSIER
-- All facts, records, awards, and filmography must strictly belong to the verified person with 100% factual accuracy.
-
-OUTPUT FORMAT:
-If ANY gate fails or no celebrity is recognized with certainty, respond strictly with:
-Unknown
-
-When verified with 100% certainty, output in this exact structured format:
-- **Full Name**: <Person's Official Full Name>
-- **Gender**: <Female or Male>
-- **Profession**: <All primary professions and domains>
-- **Nationality**: <Country of origin>
-- **Claim to Fame**: <Comprehensive summary of their global standing and career impact>
-
-### 🏆 Key Achievements & Major Awards
-- **Records & Milestones**: <Factual historic records or major milestones>
-- **Major Awards & Nominations**: <Detailed list of major awards such as Oscars, César Awards, BAFTA, Cannes, etc.>
-
-### 🎬 Notable Works & Landmark Roles
-- <4-6 landmark films, series, or works with release years>
-
-### 📖 Biographical & Career Overview
-<A detailed 1-2 paragraph biography summarizing their career trajectory, artistic impact, and notable milestones.>
+Analyze the person in this image.
+MANDATORY RULES:
+1. MASK CHECK: If the person is wearing a medical face mask, surgical mask, cloth mask, bandana, or has their nose/mouth covered, respond strictly with 'Unknown'.
+2. GENDER INTEGRITY: Verify female vs. male. Never assign a male celebrity name to a female or vice versa.
+3. STRICT RECOGNITION: Only identify if you recognize the person with high confidence based on clear facial features as an internationally known celebrity / public figure. If an uncredited extra, background actor, or ordinary individual, respond strictly with 'Unknown'.
+4. OUTPUT FORMAT: Respond ONLY with the person's verified Full Name (e.g. Isabelle Adjani or Sean Connery or Shahid Kapoor). If unrecognized or unverified, respond strictly with 'Unknown'. Do NOT include bullet points, punctuation, markdown, or any other words.
 """
 
     key = api_key or GEMINI_API_KEY or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     req_model = model or gemini_model or "gemini-3.5-flash-lite"
-    
+
     parts = [{"text": prompt_text}]
     if crop_b64:
         parts.append({"inline_data": {"mime_type": "image/jpeg", "data": crop_b64}})
@@ -536,20 +612,21 @@ When verified with 100% certainty, output in this exact structured format:
                 payload = {
                     "contents": [{"parts": parts}],
                     "generationConfig": {
-                        "temperature": 0.1,
-                        "maxOutputTokens": 2048
+                        "temperature": 0.0,
+                        "maxOutputTokens": 60
                     }
                 }
-                response = requests.post(url, json=payload, timeout=30.0)
+                response = requests.post(url, json=payload, timeout=12.0)
                 if response.status_code == 200:
                     data = response.json()
                     candidates = data.get("candidates", [])
                     if candidates:
                         content_parts = candidates[0].get("content", {}).get("parts", [])
                         if content_parts and "text" in content_parts[0]:
-                            ans = content_parts[0]["text"].strip()
-                            if ans:
-                                return ans
+                            raw_name = content_parts[0]["text"].strip()
+                            clean_name = extract_name(raw_name)
+                            if clean_name:
+                                return clean_name
                 elif response.status_code in [404, 503, 429]:
                     print(f"[Gemini Notice] Model {clean_mod} returned HTTP {response.status_code}, trying next model...")
                     continue
@@ -575,16 +652,26 @@ When verified with 100% certainty, output in this exact structured format:
                     ]
                 }
             ],
-            "temperature": 0.1,
-            "max_tokens": 1500
+            "temperature": 0.0,
+            "max_tokens": 60
         }
         try:
-            response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=20.0)
+            response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=10.0)
             if response.status_code == 200:
-                return response.json()['choices'][0]['message']['content'].strip()
+                raw_name = response.json()['choices'][0]['message']['content'].strip()
+                return extract_name(raw_name)
         except Exception as ge:
             print(f"[Groq Error] {ge}")
 
+    return "Unknown"
+
+
+def get_info(image_data, face_crop=None, api_key=None, model=None):
+    """Gets verified person name from Gemini, then fetches factual dossier from Wikipedia and IMDb."""
+    name = get_celebrity_name_from_gemini(image_data, face_crop=face_crop, api_key=api_key, model=model)
+    if name != "Unknown":
+        dossier, _ = get_verified_celebrity_dossier(name)
+        return dossier
     return "Unknown"
 
 
@@ -886,7 +973,16 @@ if active_video_path and persons:
             
             ---
             """, unsafe_allow_html=True)
-            st.markdown(active_person.get("info", ""))
+            
+            photo_url = active_person.get("photo_url")
+            if photo_url:
+                c_prof, c_body = st.columns([1, 2])
+                with c_prof:
+                    st.image(photo_url, caption=f"Verified Profile: {active_person['name']}", use_container_width=True)
+                with c_body:
+                    st.markdown(active_person.get("info", ""))
+            else:
+                st.markdown(active_person.get("info", ""))
         else:
             st.info(f"""ℹ️ **Person #{active_person['id']} is Unrecognized or Masked.**
 

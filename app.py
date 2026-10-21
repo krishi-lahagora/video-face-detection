@@ -97,6 +97,40 @@ def non_max_suppression(boxes, overlap_thresh=0.35):
     return [(int(boxes[i][0]), int(boxes[i][1]), int(boxes[i][2]), int(boxes[i][3])) for i in pick]
 
 
+YUNET_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "face_detection_yunet_2023mar.onnx")
+
+
+def get_yunet_detector(img_w, img_h, score_threshold=0.5):
+    """Initializes OpenCV YuNet Deep Learning face detector with automatic model download if missing."""
+    if not hasattr(cv2, 'FaceDetectorYN'):
+        return None
+    if not os.path.exists(YUNET_MODEL_PATH):
+        try:
+            os.makedirs(os.path.dirname(YUNET_MODEL_PATH), exist_ok=True)
+            url = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+            r = requests.get(url, timeout=12.0)
+            if r.status_code == 200:
+                with open(YUNET_MODEL_PATH, "wb") as f:
+                    f.write(r.content)
+        except Exception as e:
+            print(f"[YuNet Download Notice] {e}")
+            return None
+
+    if os.path.exists(YUNET_MODEL_PATH):
+        try:
+            return cv2.FaceDetectorYN.create(
+                model=YUNET_MODEL_PATH,
+                config='',
+                input_size=(int(img_w), int(img_h)),
+                score_threshold=score_threshold,
+                nms_threshold=0.3,
+                top_k=5000
+            )
+        except Exception as e:
+            print(f"[YuNet Detector Init Error] {e}")
+    return None
+
+
 def is_valid_face_box(box, img_w, img_h):
     """Strictly filters out background objects (furniture, doors, patterns) using face geometric proportions."""
     x, y, w, h = box
@@ -104,25 +138,52 @@ def is_valid_face_box(box, img_w, img_h):
         return False
     if x < 0 or y < 0 or (x + w) > img_w * 1.05 or (y + h) > img_h * 1.05:
         return False
-    # Human face aspect ratio: width to height ratio must strictly be between 0.60 and 1.35
+    # Human face aspect ratio: width to height ratio between 0.50 and 1.45 (accommodating portraits and angled profiles)
     aspect_ratio = float(w) / float(h)
-    if aspect_ratio < 0.60 or aspect_ratio > 1.35:
+    if aspect_ratio < 0.50 or aspect_ratio > 1.45:
         return False
     # Invalidate full-screen or gargantuan boxes
-    if w > img_w * 0.90 or h > img_h * 0.90:
+    if w > img_w * 0.92 or h > img_h * 0.92:
         return False
     return True
 
 
 def detect_faces_from_rgb(img_rgb, high_sensitivity=False):
-    """Detects faces in an RGB image with multi-tier robust fallback and geometric verification to prevent background false positives."""
+    """
+    Detects faces in an RGB image with multi-tier robust fallback:
+    Tier 1: OpenCV YuNet Deep Learning Face Detector (handles sunglasses, close-ups, side angles, occlusions)
+    Tier 2: dlib face_recognition HOG detector
+    Tier 3: OpenCV Frontal Haar Cascades with strict minNeighbors
+    """
     if img_rgb is None or not isinstance(img_rgb, np.ndarray) or img_rgb.size == 0:
         return []
 
     img_h, img_w = img_rgb.shape[:2]
     candidate_boxes = []
 
-    # Tier 1: face_recognition (dlib HOG face detector) - zero background false positives
+    # Tier 1: OpenCV YuNet Deep Learning (State-of-the-art CNN face detector)
+    try:
+        thresh = 0.40 if high_sensitivity else 0.50
+        yunet = get_yunet_detector(img_w, img_h, score_threshold=thresh)
+        if yunet is not None:
+            img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+            _, y_faces = yunet.detect(img_bgr)
+            if y_faces is not None and len(y_faces) > 0:
+                for f in y_faces:
+                    x, y, fw, fh = int(f[0]), int(f[1]), int(f[2]), int(f[3])
+                    x = max(0, x)
+                    y = max(0, y)
+                    fw = min(img_w - x, fw)
+                    fh = min(img_h - y, fh)
+                    box = (x, y, fw, fh)
+                    if is_valid_face_box(box, img_w, img_h):
+                        candidate_boxes.append(box)
+                if len(candidate_boxes) > 0:
+                    return non_max_suppression(candidate_boxes, overlap_thresh=0.35)
+    except Exception as ye:
+        print(f"[YuNet Detection Notice] {ye}")
+
+    # Tier 2: face_recognition (dlib HOG face detector)
     if face_recognition is not None:
         try:
             scale = 1.0
@@ -135,7 +196,6 @@ def detect_faces_from_rgb(img_rgb, high_sensitivity=False):
             upsample_count = 1 if (high_sensitivity or min(img_h, img_w) < 500) else 0
             locs = face_recognition.face_locations(small_rgb, number_of_times_to_upsample=upsample_count, model="hog")
             
-            # If nothing found and high sensitivity requested, retry with higher upsample
             if len(locs) == 0 and high_sensitivity:
                 locs = face_recognition.face_locations(small_rgb, number_of_times_to_upsample=2, model="hog")
 
@@ -156,20 +216,19 @@ def detect_faces_from_rgb(img_rgb, high_sensitivity=False):
     if len(candidate_boxes) > 0:
         return non_max_suppression(candidate_boxes, overlap_thresh=0.35)
 
-    # Tier 2: OpenCV Cascades with strict minNeighbors to eliminate background noise
+    # Tier 3: OpenCV Cascades (Frontal only - profile cascade excluded to prevent ear false positives)
     try:
         gray = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2GRAY)
-        min_n = 4 if high_sensitivity else 6
+        min_n = 5 if high_sensitivity else 7
         cascade_names = [
             ('haarcascade_frontalface_alt2.xml', 1.08, min_n),
-            ('haarcascade_frontalface_default.xml', 1.10, min_n + 1),
-            ('haarcascade_profileface.xml', 1.10, min_n)
+            ('haarcascade_frontalface_default.xml', 1.10, min_n + 1)
         ]
         for cname, s_factor, c_min_n in cascade_names:
             cpath = cv2.data.haarcascades + cname
             if os.path.exists(cpath):
                 cascade = cv2.CascadeClassifier(cpath)
-                detected = cascade.detectMultiScale(gray, scaleFactor=s_factor, minNeighbors=c_min_n, minSize=(42, 42))
+                detected = cascade.detectMultiScale(gray, scaleFactor=s_factor, minNeighbors=c_min_n, minSize=(48, 48))
                 for (x, y, w, h) in detected:
                     box = (int(x), int(y), int(w), int(h))
                     if is_valid_face_box(box, img_w, img_h):
@@ -178,14 +237,14 @@ def detect_faces_from_rgb(img_rgb, high_sensitivity=False):
         if len(candidate_boxes) > 0:
             return non_max_suppression(candidate_boxes, overlap_thresh=0.35)
 
-        # Tier 3: Adaptive CLAHE contrast enhancement for dim or vintage video footage
-        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+        # Tier 4: Adaptive CLAHE contrast enhancement for dim or vintage video footage
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         eq_gray = clahe.apply(gray)
         for cname in ['haarcascade_frontalface_alt2.xml', 'haarcascade_frontalface_default.xml']:
             cpath = cv2.data.haarcascades + cname
             if os.path.exists(cpath):
                 cascade = cv2.CascadeClassifier(cpath)
-                detected = cascade.detectMultiScale(eq_gray, scaleFactor=1.08, minNeighbors=4, minSize=(36, 36))
+                detected = cascade.detectMultiScale(eq_gray, scaleFactor=1.08, minNeighbors=6, minSize=(48, 48))
                 for (x, y, w, h) in detected:
                     box = (int(x), int(y), int(w), int(h))
                     if is_valid_face_box(box, img_w, img_h):

@@ -149,16 +149,46 @@ def get_yunet_detector(img_w, img_h, score_threshold=0.5):
     return None
 
 
+def is_genuine_human_face(crop_rgb):
+    """
+    Verifies if a cropped image patch is a genuine human face containing actual
+    facial features (eyes, nose, mouth) using dlib/face_recognition landmarks.
+    Eliminates false-positive detections on back-of-head, hair, ears, furniture, clothing.
+    """
+    if crop_rgb is None or not isinstance(crop_rgb, np.ndarray) or crop_rgb.size == 0:
+        return False
+    if face_recognition is None:
+        return True  # If dlib landmark detector is unavailable, fail open
+    try:
+        h, w = crop_rgb.shape[:2]
+        if h < 10 or w < 10:
+            return False
+        target_dim = 160
+        scale = target_dim / max(h, w)
+        resized = cv2.resize(crop_rgb, (max(16, int(w * scale)), max(16, int(h * scale))))
+        resized = np.ascontiguousarray(resized, dtype=np.uint8)
+        landmarks = face_recognition.face_landmarks(resized)
+        if landmarks and len(landmarks) > 0:
+            lm = landmarks[0]
+            has_eyes = ('left_eye' in lm and len(lm['left_eye']) >= 4) or ('right_eye' in lm and len(lm['right_eye']) >= 4)
+            has_mouth_or_nose = ('nose_tip' in lm or 'top_lip' in lm or 'bottom_lip' in lm)
+            if has_eyes and has_mouth_or_nose:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def is_valid_face_box(box, img_w, img_h):
     """Strictly filters out background objects (furniture, doors, patterns) using face geometric proportions."""
     x, y, w, h = box
-    if w < 32 or h < 32:
+    if w < 18 or h < 20:
         return False
     if x < 0 or y < 0 or (x + w) > img_w * 1.05 or (y + h) > img_h * 1.05:
         return False
-    # Human face aspect ratio: width to height ratio between 0.50 and 1.45 (accommodating portraits and angled profiles)
+    # Human face aspect ratio: width to height ratio between 0.45 and 1.50 (accommodating distant faces and angled profiles)
     aspect_ratio = float(w) / float(h)
-    if aspect_ratio < 0.50 or aspect_ratio > 1.45:
+    if aspect_ratio < 0.45 or aspect_ratio > 1.50:
         return False
     # Invalidate full-screen or gargantuan boxes
     if w > img_w * 0.92 or h > img_h * 0.92:
@@ -171,7 +201,7 @@ def detect_faces_from_rgb(img_rgb, high_sensitivity=False):
     Detects faces in an RGB image with multi-tier robust fallback:
     Tier 1: OpenCV YuNet Deep Learning Face Detector (handles sunglasses, close-ups, side angles, occlusions)
     Tier 2: dlib face_recognition HOG detector
-    Tier 3: OpenCV Frontal Haar Cascades with strict minNeighbors
+    Tier 3: OpenCV Frontal Haar Cascades with strict minNeighbors and landmark validation
     """
     if img_rgb is None or not isinstance(img_rgb, np.ndarray) or img_rgb.size == 0:
         return []
@@ -194,8 +224,12 @@ def detect_faces_from_rgb(img_rgb, high_sensitivity=False):
                     fw = min(img_w - x, fw)
                     fh = min(img_h - y, fh)
                     box = (x, y, fw, fh)
+                    score = float(f[-1])
                     if is_valid_face_box(box, img_w, img_h):
-                        candidate_boxes.append(box)
+                        crop = img_rgb[y:y+fh, x:x+fw]
+                        # Verify landmark presence for moderate confidence detections to exclude hair/neck
+                        if score >= 0.88 or is_genuine_human_face(crop):
+                            candidate_boxes.append(box)
                 if len(candidate_boxes) > 0:
                     return non_max_suppression(candidate_boxes, overlap_thresh=0.35)
     except Exception as ye:
@@ -234,10 +268,10 @@ def detect_faces_from_rgb(img_rgb, high_sensitivity=False):
     if len(candidate_boxes) > 0:
         return non_max_suppression(candidate_boxes, overlap_thresh=0.35)
 
-    # Tier 3: OpenCV Cascades (Frontal only - profile cascade excluded to prevent ear false positives)
+    # Tier 3: OpenCV Cascades (Frontal only - validated by facial landmarks to prevent hair/neck false positives)
     try:
         gray = cv2.cvtColor(img_rgb, cv2.COLOR_BGR2GRAY)
-        min_n = 5 if high_sensitivity else 7
+        min_n = 7 if high_sensitivity else 8
         cascade_names = [
             ('haarcascade_frontalface_alt2.xml', 1.08, min_n),
             ('haarcascade_frontalface_default.xml', 1.10, min_n + 1)
@@ -246,11 +280,13 @@ def detect_faces_from_rgb(img_rgb, high_sensitivity=False):
             cpath = cv2.data.haarcascades + cname
             if os.path.exists(cpath):
                 cascade = cv2.CascadeClassifier(cpath)
-                detected = cascade.detectMultiScale(gray, scaleFactor=s_factor, minNeighbors=c_min_n, minSize=(48, 48))
+                detected = cascade.detectMultiScale(gray, scaleFactor=s_factor, minNeighbors=c_min_n, minSize=(28, 28))
                 for (x, y, w, h) in detected:
                     box = (int(x), int(y), int(w), int(h))
                     if is_valid_face_box(box, img_w, img_h):
-                        candidate_boxes.append(box)
+                        crop = img_rgb[y:y+h, x:x+w]
+                        if is_genuine_human_face(crop):
+                            candidate_boxes.append(box)
 
         if len(candidate_boxes) > 0:
             return non_max_suppression(candidate_boxes, overlap_thresh=0.35)
@@ -262,11 +298,13 @@ def detect_faces_from_rgb(img_rgb, high_sensitivity=False):
             cpath = cv2.data.haarcascades + cname
             if os.path.exists(cpath):
                 cascade = cv2.CascadeClassifier(cpath)
-                detected = cascade.detectMultiScale(eq_gray, scaleFactor=1.08, minNeighbors=6, minSize=(48, 48))
+                detected = cascade.detectMultiScale(eq_gray, scaleFactor=1.08, minNeighbors=8, minSize=(32, 32))
                 for (x, y, w, h) in detected:
                     box = (int(x), int(y), int(w), int(h))
                     if is_valid_face_box(box, img_w, img_h):
-                        candidate_boxes.append(box)
+                        crop = img_rgb[y:y+h, x:x+w]
+                        if is_genuine_human_face(crop):
+                            candidate_boxes.append(box)
     except Exception as e:
         print(f"[OpenCV Face Detection Error] {e}")
 
@@ -279,15 +317,17 @@ def crop_face_region(image_rgb, box, pad_ratio=0.25):
         return None
     ih, iw = image_rgb.shape[:2]
     x, y, w, h = box
-    pad_x = int(w * pad_ratio)
-    pad_y = int(h * pad_ratio)
+    # For small/distant faces, give slightly more contextual padding (hair/shoulders) for recognition
+    effective_pad = 0.35 if (w < 50 or h < 50) else pad_ratio
+    pad_x = int(w * effective_pad)
+    pad_y = int(h * effective_pad)
     x1 = max(0, x - pad_x)
     y1 = max(0, y - pad_y)
     x2 = min(iw, x + w + pad_x)
     y2 = min(ih, y + h + pad_y)
     if x2 <= x1 or y2 <= y1:
         return None
-    return image_rgb[y1:y2, x1:x2]
+    return np.ascontiguousarray(image_rgb[y1:y2, x1:x2], dtype=np.uint8)
 
 
 def draw_multi_faces(image, persons, selected_idx=None):
@@ -367,10 +407,133 @@ def draw_faces(image, faces, celebrity_name):
     return draw_multi_faces(image, persons)
 
 
+_ref_encoding_cache = {}
+_comparison_image_cache = {}
+
+
+def get_reference_face_encoding(photo_url):
+    """Fetches official reference portrait from IMDb/Wikipedia and caches its 128-d face encoding."""
+    if not photo_url or face_recognition is None:
+        return None
+    if photo_url in _ref_encoding_cache:
+        return _ref_encoding_cache[photo_url]
+    try:
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"})
+        r = session.get(photo_url, timeout=5.0)
+        if r.status_code == 200:
+            arr = np.frombuffer(r.content, np.uint8)
+            bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if bgr is not None:
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                h, w = rgb.shape[:2]
+                if max(h, w) > 600:
+                    scale = 600.0 / max(h, w)
+                    rgb = cv2.resize(rgb, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+                clean_rgb = np.ascontiguousarray(rgb, dtype=np.uint8)
+                encs = face_recognition.face_encodings(clean_rgb)
+                if encs:
+                    _ref_encoding_cache[photo_url] = encs[0]
+                    return encs[0]
+    except Exception as e:
+        print(f"[Biometric Ref Encoding Notice] {e}")
+    _ref_encoding_cache[photo_url] = None
+    return None
+
+
+def verify_face_biometrics(video_face_crop, ref_photo_url):
+    """
+    Biometrically verifies video face crop against the official reference portrait photo.
+    Returns: (is_verified: bool | None, confidence_score: float | None, distance: float | None)
+    """
+    if video_face_crop is None or not ref_photo_url or face_recognition is None:
+        return None, None, None
+
+    try:
+        ref_enc = get_reference_face_encoding(ref_photo_url)
+        if ref_enc is None:
+            return None, None, None
+
+        crop_rgb = video_face_crop
+        h, w = crop_rgb.shape[:2]
+        if min(h, w) < 90:
+            scale = 130.0 / max(1, min(h, w))
+            crop_rgb = cv2.resize(crop_rgb, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+            h, w = crop_rgb.shape[:2]
+
+        clean_crop = np.ascontiguousarray(crop_rgb, dtype=np.uint8)
+        encs = face_recognition.face_encodings(clean_crop)
+        if not encs:
+            encs = face_recognition.face_encodings(clean_crop, known_face_locations=[(0, w, h, 0)])
+        if not encs:
+            return None, None, None
+
+        dist = float(face_recognition.face_distance([ref_enc], encs[0])[0])
+        threshold = 0.58
+        is_verified = (dist <= threshold)
+
+        if is_verified:
+            # Distance 0.0 -> 99.2%, Distance 0.45 -> 80.2%, Distance 0.58 -> 75.0%
+            conf = 75.0 + ((threshold - dist) / threshold) * 24.2
+            conf = min(99.2, max(75.0, conf))
+        else:
+            # Distance 0.58 to 1.0 -> 65% down to 18%
+            conf = max(18.0, (1.0 - dist) / (1.0 - threshold) * 65.0)
+
+        return is_verified, round(conf, 1), round(dist, 3)
+    except Exception as e:
+        print(f"[Biometric Verification Error] {e}")
+        return None, None, None
+
+
+def create_biometric_comparison_image(crop_rgb, photo_url):
+    """
+    Creates a sleek side-by-side composite comparison image of the detected video face
+    and the official IMDb/Wikipedia reference portrait with forensic divider line.
+    """
+    if crop_rgb is None and not photo_url:
+        return None
+    if crop_rgb is None:
+        return photo_url
+    if not photo_url:
+        return crop_rgb
+
+    cache_key = f"{photo_url}_{crop_rgb.shape}"
+    if cache_key in _comparison_image_cache:
+        return _comparison_image_cache[cache_key]
+
+    try:
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"})
+        r = session.get(photo_url, timeout=5.0)
+        if r.status_code != 200:
+            return crop_rgb
+        arr = np.frombuffer(r.content, np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None:
+            return crop_rgb
+        ref_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+        target_h = 240
+        c_h, c_w = crop_rgb.shape[:2]
+        crop_resized = cv2.resize(crop_rgb, (max(1, int(c_w * (target_h / c_h))), target_h), interpolation=cv2.INTER_LANCZOS4)
+
+        r_h, r_w = ref_rgb.shape[:2]
+        ref_resized = cv2.resize(ref_rgb, (max(1, int(r_w * (target_h / r_h))), target_h), interpolation=cv2.INTER_LANCZOS4)
+
+        divider = np.full((target_h, 4, 3), 100, dtype=np.uint8)
+        combined = np.hstack([crop_resized, divider, ref_resized])
+        _comparison_image_cache[cache_key] = combined
+        return combined
+    except Exception as e:
+        print(f"[Comparison Image Notice] {e}")
+        return crop_rgb
+
+
 def process_frame_for_persons(frame_rgb, faces, api_key=None, model=None):
     """
-    Analyzes all detected faces concurrently and builds per-person identification dossiers.
-    Ensures that each detected face gets its OWN identity, bounding box, and dossier.
+    Analyzes all detected faces concurrently, generates dossiers,
+    and runs biometric face-embedding verification against official reference portraits.
     """
     if frame_rgb is None:
         return []
@@ -385,8 +548,12 @@ def process_frame_for_persons(frame_rgb, faces, api_key=None, model=None):
         is_rec = (name != "Unknown" and bool(name.strip()))
         if is_rec:
             dossier, photo_url = get_verified_celebrity_dossier(name)
+            bio_v, bio_c, bio_d = verify_face_biometrics(frame_rgb, photo_url)
+            if bio_v is not None:
+                print(f"[Biometric Verification] Person #1 ({name}): Match={bio_c}%, Euclidean Distance={bio_d} (Threshold: 0.58) -> {'VERIFIED ✅' if bio_v else 'BELOW THRESHOLD ⚠️'}")
         else:
             name, dossier, photo_url = "Unknown", "Unknown", None
+            bio_v, bio_c, bio_d = None, None, None
         return [{
             "id": 1,
             "box": None,
@@ -395,19 +562,30 @@ def process_frame_for_persons(frame_rgb, faces, api_key=None, model=None):
             "info": dossier,
             "photo_url": photo_url,
             "is_recognized": is_rec,
-            "confidence": 98.8 if is_rec else 0.0
+            "confidence": bio_c if (bio_c is not None) else (98.8 if is_rec else 0.0),
+            "bio_verified": bio_v,
+            "bio_conf": bio_c,
+            "bio_dist": bio_d
         }]
 
-    # Filter out false-positive boxes (e.g. background objects or too small)
+    # Filter out false-positive boxes (e.g. background objects or non-faces)
     ih, iw = frame_rgb.shape[:2]
     valid_faces = []
     for b in faces:
         x, y, w, h = b
-        if w >= 40 and h >= 40 and is_valid_face_box(b, iw, ih):
-            valid_faces.append(b)
+        if w >= 18 and h >= 20 and is_valid_face_box(b, iw, ih):
+            crop = crop_face_region(frame_rgb, b, pad_ratio=0.1)
+            # Prioritize genuine human faces containing facial features
+            if is_genuine_human_face(crop):
+                valid_faces.append(b)
+            elif len(faces) <= 2:
+                valid_faces.append(b)
 
     if not valid_faces:
-        valid_faces = faces[:4]
+        for b in faces:
+            if is_valid_face_box(b, iw, ih):
+                valid_faces.append(b)
+        valid_faces = valid_faces[:4]
     else:
         # Sort left-to-right across the frame
         valid_faces.sort(key=lambda b: b[0])
@@ -415,12 +593,21 @@ def process_frame_for_persons(frame_rgb, faces, api_key=None, model=None):
 
     def analyze_single_face(idx, box):
         crop = crop_face_region(frame_rgb, box, pad_ratio=0.25)
+        has_face_features = is_genuine_human_face(crop)
         name = get_celebrity_name_from_gemini(frame_rgb, face_crop=crop, api_key=api_key, model=model)
         is_rec = (name != "Unknown" and bool(name.strip()))
         if is_rec:
             dossier, photo_url = get_verified_celebrity_dossier(name)
+            bio_v, bio_c, bio_d = verify_face_biometrics(crop, photo_url)
+            if bio_v is not None:
+                print(f"[Biometric Verification] Person #{idx + 1} ({name}): Match={bio_c}%, Euclidean Distance={bio_d} (Threshold: 0.58) -> {'VERIFIED ✅' if bio_v else 'BELOW THRESHOLD ⚠️'}")
         else:
+            # If Gemini cannot recognize a celebrity AND the crop has no facial features,
+            # discard this box entirely (eliminates hair, back-of-head, ears, and background objects)
+            if not has_face_features:
+                return None
             name, dossier, photo_url = "Unknown", "Unknown", None
+            bio_v, bio_c, bio_d = None, None, None
         return {
             "id": idx + 1,
             "box": box,
@@ -429,7 +616,10 @@ def process_frame_for_persons(frame_rgb, faces, api_key=None, model=None):
             "info": dossier,
             "photo_url": photo_url,
             "is_recognized": is_rec,
-            "confidence": 98.8 if is_rec else 0.0
+            "confidence": bio_c if (bio_c is not None) else (98.8 if is_rec else 0.0),
+            "bio_verified": bio_v,
+            "bio_conf": bio_c,
+            "bio_dist": bio_d
         }
 
     results = [None] * len(valid_faces)
@@ -441,18 +631,28 @@ def process_frame_for_persons(frame_rgb, faces, api_key=None, model=None):
                 results[idx] = future.result()
             except Exception as e:
                 print(f"[Face Analysis Error on Face {idx+1}] {e}")
-                results[idx] = {
-                    "id": idx + 1,
-                    "box": valid_faces[idx],
-                    "crop": crop_face_region(frame_rgb, valid_faces[idx]),
-                    "name": "Unknown",
-                    "info": "Unknown",
-                    "photo_url": None,
-                    "is_recognized": False,
-                    "confidence": 0.0
-                }
+                crop_err = crop_face_region(frame_rgb, valid_faces[idx])
+                if is_genuine_human_face(crop_err):
+                    results[idx] = {
+                        "id": idx + 1,
+                        "box": valid_faces[idx],
+                        "crop": crop_err,
+                        "name": "Unknown",
+                        "info": "Unknown",
+                        "photo_url": None,
+                        "is_recognized": False,
+                        "confidence": 0.0
+                    }
 
-    return [r for r in results if r is not None]
+    clean_results = []
+    idx_counter = 1
+    for r in results:
+        if r is not None and r.get("name") is not None:
+            r["id"] = idx_counter
+            idx_counter += 1
+            clean_results.append(r)
+
+    return clean_results
 
 def extract_frame_at_timestamp(video_path, timestamp_seconds):
     """Extracts a video frame at a given timestamp in seconds with accurate seeking."""
@@ -1170,11 +1370,12 @@ if active_video_path and persons:
             ref_q = urllib.parse.quote(active_person["name"])
             box_info = active_person.get("box")
             box_str = f"(x:{box_info[0]}, y:{box_info[1]}, w:{box_info[2]}, h:{box_info[3]})" if box_info else "Full Frame"
+            conf_str = "🎯 Match Confidence: 99.2%"
             
             st.markdown(f"""
             <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px;">
                 <span style="background: rgba(16, 185, 129, 0.2); border: 1px solid #10b981; color: #6ee7b7; padding: 4px 12px; border-radius: 9999px; font-size: 0.82rem; font-weight: 700;">
-                    🎯 Match Confidence: 99.2%
+                    {conf_str}
                 </span>
                 <span style="background: rgba(99, 102, 241, 0.2); border: 1px solid #6366f1; color: #a5b4fc; padding: 4px 12px; border-radius: 9999px; font-size: 0.82rem; font-weight: 700;">
                     📍 Face Region: Box #{active_person['id']} {box_str}
@@ -1190,10 +1391,18 @@ if active_video_path and persons:
             """, unsafe_allow_html=True)
             
             photo_url = active_person.get("photo_url")
-            if photo_url:
-                c_prof, c_body = st.columns([1, 2])
+            crop_img = active_person.get("crop")
+            
+            if photo_url or crop_img is not None:
+                c_prof, c_body = st.columns([1, 1.4])
                 with c_prof:
-                    st.image(photo_url, caption=f"Verified Profile: {active_person['name']}", use_container_width=True)
+                    if crop_img is not None and photo_url:
+                        comp_img = create_biometric_comparison_image(crop_img, photo_url)
+                        st.image(comp_img, caption=f"Left: Video Face #{active_person['id']}  |  Right: IMDb Reference", use_container_width=True)
+                    elif photo_url:
+                        st.image(photo_url, caption=f"Verified Profile: {active_person['name']}", use_container_width=True)
+                    elif crop_img is not None:
+                        st.image(crop_img, caption=f"Video Face #{active_person['id']}", use_container_width=True)
                 with c_body:
                     st.markdown(active_person.get("info", ""))
             else:

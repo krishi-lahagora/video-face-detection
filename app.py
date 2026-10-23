@@ -685,37 +685,48 @@ def extract_frame_at_timestamp(video_path, timestamp_seconds):
     return frame_rgb, faces
 
 
+def clean_person_name(raw):
+    """Strips conversational LLM prefixes, parentheticals, and punctuation to extract pure celebrity name."""
+    if not raw or raw.strip().lower() in ["unknown", "n/a", "none", "unidentified", "unrecognized"]:
+        return "Unknown"
+    first_line = raw.strip().splitlines()[0].strip()
+    cleaned = first_line.strip(" *\"'\t\n\r")
+    prefixes = [
+        "the person is", "this is", "it is", "it looks like", "it appears to be",
+        "the celebrity is", "identified as", "celebrity:", "name:", "actor", "actress"
+    ]
+    for p in prefixes:
+        if cleaned.lower().startswith(p + " "):
+            cleaned = cleaned[len(p):].strip(" :-,*\"'")
+            break
+    cleaned = re.sub(r"\s*\([^)]+\)", "", cleaned).strip()
+    cleaned = re.sub(r"^[A-Z][a-z]+:\s*", "", cleaned).strip()
+    cleaned = cleaned.strip(" *\"'[](),.")
+    return cleaned if len(cleaned) >= 2 else "Unknown"
+
+
 def extract_name(content):
     """Parses the real celebrity / person full name from Gemini response with strict validation."""
     if not content or content.strip() in ["Unknown", ""]:
         return "Unknown"
         
-    first_line = content.strip().splitlines()[0].strip()
-    if first_line.lower() in ["unknown", "**unknown**", "unknown.", "- unknown", "- **full name**: unknown"]:
-        return "Unknown"
-
     bad_terms = ["unknown", "n/a", "none", "unidentified", "unrecognized", "masked", "not identified", "cannot identify"]
-
-    # Check if first line is directly a name (e.g. 'Shahid Kapoor' or 'Isabelle Adjani')
-    if not first_line.startswith("-") and ":" not in first_line:
-        cleaned = first_line.strip(" *\"'()[]")
-        if cleaned and not any(bad in cleaned.lower() for bad in bad_terms):
-            return cleaned
 
     for line in content.splitlines():
         clean = line.strip()
-        if clean.lower().startswith("- **full name**:") or clean.lower().startswith("**full name**:"):
+        lower = clean.lower()
+        if lower.startswith("- **full name**:") or lower.startswith("**full name**:") or lower.startswith("full name:"):
             parts = clean.split(":", 1)
             if len(parts) > 1:
-                name = parts[1].strip(" *\"'()[]")
-                if name and not any(bad in name.lower() for bad in bad_terms):
-                    return name
-        elif clean.lower().startswith("full name:"):
-            parts = clean.split(":", 1)
-            if len(parts) > 1:
-                name = parts[1].strip(" *\"'()[]")
-                if name and not any(bad in name.lower() for bad in bad_terms):
-                    return name
+                cand = clean_person_name(parts[1])
+                if cand != "Unknown" and not any(bad in cand.lower() for bad in bad_terms):
+                    return cand
+
+    first_line = content.strip().splitlines()[0].strip()
+    cand = clean_person_name(first_line)
+    if cand != "Unknown" and not any(bad in cand.lower() for bad in bad_terms):
+        return cand
+
     return "Unknown"
 
 
@@ -747,57 +758,93 @@ def to_jpeg_base64(img_data, max_dim=768, quality=85):
 
 
 def fetch_wikipedia_data(name):
-    """Fetches verified biographical data, description, full intro lead, and thumbnail from Wikipedia REST & Action APIs."""
+    """
+    Fetches verified biographical data, description, full intro lead, and thumbnail
+    from Wikipedia REST & Action APIs, with disambiguation protection.
+    """
     if not name or name == "Unknown":
         return None
     try:
         session = requests.Session()
         session.headers.update({"User-Agent": "CelebrityRecognitionStudio/2.0 (contact: info@example.com)"})
-        # Search for best Wikipedia title match
-        search_url = "https://en.wikipedia.org/w/api.php"
-        search_params = {
-            "action": "query",
-            "list": "search",
-            "srsearch": name,
-            "format": "json",
-            "srlimit": 1
-        }
-        res = session.get(search_url, params=search_params, timeout=5.0)
-        if res.status_code == 200:
+        
+        # Build search queries: primary name, and actor/actress disambiguated queries for short names
+        search_queries = [name]
+        words = name.strip().split()
+        if len(words) == 1:
+            search_queries.append(f"{name} (actor)")
+            search_queries.append(f"{name} (actress)")
+            search_queries.append(f"{name} actor")
+        elif len(words) <= 2:
+            search_queries.append(f"{name} actor OR actress")
+
+        best_title = None
+        for q in search_queries:
+            search_url = "https://en.wikipedia.org/w/api.php"
+            search_params = {
+                "action": "query",
+                "list": "search",
+                "srsearch": q,
+                "format": "json",
+                "srlimit": 5
+            }
+            res = session.get(search_url, params=search_params, timeout=5.0)
+            if res.status_code != 200:
+                continue
             hits = res.json().get("query", {}).get("search", [])
-            if hits:
-                title = hits[0]["title"]
-                wiki_data = {"title": title}
-                
-                # 1. Page Summary (thumbnail & URLs)
-                try:
-                    sum_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{requests.utils.quote(title)}"
-                    sum_res = session.get(sum_url, timeout=5.0)
-                    if sum_res.status_code == 200:
-                        wiki_data.update(sum_res.json())
-                except Exception:
-                    pass
+            for h in hits:
+                t = h.get("title", "")
+                snippet = h.get("snippet", "").lower()
+                # Skip disambiguation, list, or dictionary pages
+                if "may refer to" in snippet or "wiktionary" in snippet or "(disambiguation)" in t.lower() or "filmography" in t.lower() or "discography" in t.lower():
+                    continue
+                # If searching with actor context or hits have actor/actress/film terms, accept
+                if any(term in snippet or term in t.lower() for term in ["actor", "actress", "film", "cinema", "director", "singer", "producer", "television", "model"]):
+                    best_title = t
+                    break
+                if not best_title:
+                    best_title = t
+            if best_title:
+                break
 
-                # 2. Comprehensive intro lead (all introductory paragraphs, awards, filmography)
-                try:
-                    lead_url = f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&titles={requests.utils.quote(title)}&format=json"
-                    lead_res = session.get(lead_url, timeout=5.0)
-                    if lead_res.status_code == 200:
-                        pages = lead_res.json().get("query", {}).get("pages", {})
-                        for pid, p in pages.items():
-                            wiki_data["full_lead"] = p.get("extract", "")
-                            break
-                except Exception:
-                    pass
+        if not best_title:
+            return None
 
-                return wiki_data
+        wiki_data = {"title": best_title}
+
+        # 1. Page Summary (thumbnail & URLs)
+        try:
+            sum_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{requests.utils.quote(best_title)}"
+            sum_res = session.get(sum_url, timeout=5.0)
+            if sum_res.status_code == 200:
+                sum_json = sum_res.json()
+                if sum_json.get("type") != "disambiguation":
+                    wiki_data.update(sum_json)
+        except Exception:
+            pass
+
+        # 2. Comprehensive intro lead (all introductory paragraphs, awards, filmography)
+        try:
+            lead_url = f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&titles={requests.utils.quote(best_title)}&format=json"
+            lead_res = session.get(lead_url, timeout=5.0)
+            if lead_res.status_code == 200:
+                pages = lead_res.json().get("query", {}).get("pages", {})
+                for pid, p in pages.items():
+                    extract_text = p.get("extract", "")
+                    if extract_text and "may refer to:" not in extract_text:
+                        wiki_data["full_lead"] = extract_text
+                    break
+        except Exception:
+            pass
+
+        return wiki_data
     except Exception as e:
         print(f"[Wikipedia API Notice] {e}")
     return None
 
 
-def fetch_imdb_data(name):
-    """Fetches verified credits, landmark roles, and official profile photo from IMDb API."""
+def fetch_imdb_data(name, wiki_title=None):
+    """Fetches verified credits, landmark roles, and official profile photo from IMDb API with smart entity matching."""
     if not name or name == "Unknown":
         return None
     try:
@@ -807,15 +854,41 @@ def fetch_imdb_data(name):
         headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
         r = requests.get(url, headers=headers, timeout=4.0)
         if r.status_code == 200:
-            for item in r.json().get("d", []):
-                if item.get("id", "").startswith("nm"):
-                    return {
-                        "imdb_id": item.get("id"),
-                        "name": item.get("l"),
-                        "role": item.get("s"),
-                        "image": item.get("i", {}).get("imageUrl"),
-                        "url": f"https://www.imdb.com/name/{item.get('id')}/"
-                    }
+            candidates = [it for it in r.json().get("d", []) if it.get("id", "").startswith("nm")]
+            if candidates:
+                best_item = None
+                target_lower = name.strip().lower()
+                # 1. Exact name match
+                for it in candidates:
+                    if it.get("l", "").strip().lower() == target_lower:
+                        best_item = it
+                        break
+                # 2. Match with wiki title if available (e.g. C. Joseph Vijay matches Joseph Vijay)
+                if not best_item and wiki_title:
+                    clean_wiki = re.sub(r'^(?:c\.|dr\.|mr\.)\s*', '', wiki_title, flags=re.IGNORECASE).strip().lower()
+                    for it in candidates:
+                        it_name = it.get("l", "").strip().lower()
+                        if clean_wiki in it_name or it_name in clean_wiki:
+                            best_item = it
+                            break
+                # 3. Item with actor/actress in role description
+                if not best_item:
+                    for it in candidates:
+                        role_str = (it.get("s") or "").lower()
+                        if any(k in role_str for k in ["actor", "actress", "director", "producer"]):
+                            best_item = it
+                            break
+                # Fallback to first item if none matched specifically
+                if not best_item:
+                    best_item = candidates[0]
+
+                return {
+                    "imdb_id": best_item.get("id"),
+                    "name": best_item.get("l"),
+                    "role": best_item.get("s"),
+                    "image": best_item.get("i", {}).get("imageUrl"),
+                    "url": f"https://www.imdb.com/name/{best_item.get('id')}/"
+                }
     except Exception as e:
         print(f"[IMDb API Notice] {e}")
     return None
@@ -834,16 +907,28 @@ def get_verified_celebrity_dossier(name, api_key=None):
     if not name or name == "Unknown":
         return "Unknown", None
 
-    wiki = fetch_wikipedia_data(name)
-    imdb = fetch_imdb_data(name)
+    clean_name = clean_person_name(name)
+    if clean_name == "Unknown":
+        clean_name = name
+
+    wiki = fetch_wikipedia_data(clean_name)
+    wiki_title = wiki.get("title") if wiki else None
+    imdb = fetch_imdb_data(clean_name, wiki_title=wiki_title)
 
     # Pick official photo from IMDb or Wikipedia
     photo = (imdb.get("image") if imdb else None) or (wiki.get("thumbnail", {}).get("source") if wiki else None)
-    display_name = (imdb.get("name") if imdb else None) or (wiki.get("title") if wiki else name)
+    raw_display = (imdb.get("name") if imdb else None) or (wiki.get("title") if wiki else clean_name)
+    # Strip (actor), (actress), (born 19xx) from display name
+    display_name = re.sub(r'\s*\([^)]+\)$', '', raw_display).strip()
+
     extract = wiki.get("extract") if wiki else ""
     full_lead = wiki.get("full_lead") if wiki else ""
     desc = wiki.get("description") if wiki else ""
     role = imdb.get("role") if imdb else ""
+
+    # Reject description if it contains disambiguation text
+    if any(d in desc.lower() for d in ["topics referred to", "disambiguation", "may refer to"]):
+        desc = ""
 
     # Official database links
     ref_links = []
@@ -851,7 +936,7 @@ def get_verified_celebrity_dossier(name, api_key=None):
         ref_links.append(f"[🌐 Wikipedia Official Page]({wiki['content_urls']['desktop']['page']})")
     if imdb and imdb.get("url"):
         ref_links.append(f"[🎬 IMDb Profile & Filmography]({imdb['url']})")
-    ref_links.append(f"[🔍 Google Knowledge Graph](https://www.google.com/search?q={urllib.parse.quote(name)})")
+    ref_links.append(f"[🔍 Google Knowledge Graph](https://www.google.com/search?q={urllib.parse.quote(display_name)})")
     ref_footer = f"- **Authoritative Reference Sources**: {' • '.join(ref_links)}"
 
     # Choose best text source (full intro lead preferred over short extract)
@@ -866,6 +951,8 @@ def get_verified_celebrity_dossier(name, api_key=None):
     clean_p1 = re.sub(r'\(pronounced\s+\[[^\]]+\];?\s*', '(', p1)
     name_match = re.match(r'^([A-Z][a-zA-Z\s\"\.\'-]+?)(?:\s*\([^\)]+\))', clean_p1)
     full_name = name_match.group(1).strip() if name_match else display_name
+    if any(bad in full_name.lower() for bad in ["topics referred", "may refer", "disambiguation"]):
+        full_name = display_name
 
     # 2. Nationality detection
     nationality = "Indian"
@@ -878,14 +965,14 @@ def get_verified_celebrity_dossier(name, api_key=None):
     prof = desc or ""
     if "(" in prof:
         prof = prof.split("(")[0].strip()
-    if not prof:
+    if not prof or any(bad in prof.lower() for bad in ["topics referred", "disambiguation"]):
         m_prof = re.search(r'is an?\s+([A-Za-z\s,]+?)\s+who\s+', p1)
         if m_prof:
             prof = m_prof.group(1).replace(nationality, "").strip().strip(",").title()
-    if not prof and role:
+    if (not prof or any(bad in prof.lower() for bad in ["topics referred", "disambiguation"])) and role:
         prof = role.split(",")[0].strip()
-    if not prof:
-        prof = "Actor and Public Figure"
+    if not prof or any(bad in prof.lower() for bad in ["topics referred", "disambiguation"]):
+        prof = "Acclaimed Actor and Public Figure"
 
     # 4. Sentences across all paragraphs
     all_sentences = []
@@ -897,7 +984,7 @@ def get_verified_celebrity_dossier(name, api_key=None):
 
     # 5. Claim to Fame
     claim = ""
-    for s in all_sentences[1:4]:
+    for s in all_sentences[1:5]:
         if any(k in s.lower() for k in ["highest-paid", "highest-grossing", "prominent", "known for", "iconic", "established", "debut", "star", "commercial"]):
             claim = s
             break

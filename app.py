@@ -1078,14 +1078,13 @@ def get_celebrity_name_from_gemini(image_data, face_crop=None, api_key=None, mod
 
 Analyze the person in this image.
 MANDATORY RULES:
-1. MASK CHECK: If the person is wearing a medical face mask, surgical mask, cloth mask, bandana, or has their nose/mouth covered, respond strictly with 'Unknown'.
+1. MASK CHECK: If the person is wearing a medical face mask, surgical mask, cloth mask, bandana, or has their nose/mouth covered by cloth, respond strictly with 'Unknown'. Natural beards, mustaches, or facial hair are NOT masks.
 2. GENDER INTEGRITY: Verify female vs. male. Never assign a male celebrity name to a female or vice versa.
-3. STRICT RECOGNITION: Only identify if you recognize the person with high confidence based on clear facial features as an internationally known celebrity / public figure. If an uncredited extra, background actor, or ordinary individual, respond strictly with 'Unknown'.
-4. OUTPUT FORMAT: Respond ONLY with the person's verified Full Name (e.g. Isabelle Adjani or Sean Connery or Shahid Kapoor). If unrecognized or unverified, respond strictly with 'Unknown'. Do NOT include bullet points, punctuation, markdown, or any other words.
-"""
+3. RECOGNITION: Identify the verified celebrity / actor / public figure (including Indian, regional cinema, television, Bollywood, Tollywood, or international figures). If an uncredited extra, background actor, or ordinary individual, respond strictly with 'Unknown'.
+4. OUTPUT FORMAT: Respond ONLY with the person's verified Full Name (e.g. Neil Bhatt or Isabelle Adjani or Shahid Kapoor). If unrecognized, respond strictly with 'Unknown'."""
 
     key = api_key or GEMINI_API_KEY or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    req_model = model or gemini_model or "gemini-3.5-flash-lite"
+    req_model = model or gemini_model or "gemini-3-flash-preview"
 
     parts = [{"text": prompt_text}]
     if crop_b64:
@@ -1096,9 +1095,9 @@ MANDATORY RULES:
     if key:
         models_to_try = [
             req_model,
-            "gemini-3.5-flash-lite",
             "gemini-3-flash-preview",
             "gemini-3.1-flash-lite",
+            "gemini-3.8-flash",
             "gemini-3.5-flash",
             "gemini-flash-latest"
         ]
@@ -1113,7 +1112,7 @@ MANDATORY RULES:
                     "contents": [{"parts": parts}],
                     "generationConfig": {
                         "temperature": 0.0,
-                        "maxOutputTokens": 60
+                        "maxOutputTokens": 600
                     }
                 }
                 response = requests.post(url, json=payload, timeout=12.0)
@@ -1125,7 +1124,7 @@ MANDATORY RULES:
                         if content_parts and "text" in content_parts[0]:
                             raw_name = content_parts[0]["text"].strip()
                             clean_name = extract_name(raw_name)
-                            if clean_name:
+                            if clean_name and clean_name != "Unknown":
                                 return clean_name
                 elif response.status_code in [404, 503, 429]:
                     print(f"[Gemini Notice] Model {clean_mod} returned HTTP {response.status_code}, trying next model...")
@@ -1439,8 +1438,8 @@ if active_video_path and persons:
         st.image(annotated_frame, caption=f"Detected Faces at {v_ts:.1f}s (Focused on Person #{active_person['id']})", use_container_width=True)
 
     with col_res2:
-        badge_status = "Verified Celebrity" if active_person.get("is_recognized") else "Unverified / Masked"
-        badge_color = "#34d399" if active_person.get("is_recognized") else "#f87171"
+        badge_status = "Verified Celebrity" if active_person.get("is_recognized") else "Public Record Not Found"
+        badge_color = "#34d399" if active_person.get("is_recognized") else "#fbbf24"
         
         st.markdown(f"""
         <div style="background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(99, 102, 241, 0.3); border-radius: 12px; padding: 18px 22px; margin-bottom: 12px;">
@@ -1495,10 +1494,10 @@ if active_video_path and persons:
             else:
                 st.markdown(active_person.get("info", ""))
         else:
-            st.info(f"""ℹ️ **Person #{active_person['id']} is Unrecognized or Masked.**
+            st.info(f"""ℹ️ **Person #{active_person['id']} — Public Celebrity Record Not Found**
 
 The AI facial verification engine did not find an authoritative public figure match for this specific face:
-- **Mask / Occlusion Policy:** When a person is wearing a face mask or cloth covering, identity is strictly withheld to prevent false positives.
-- **Independent Analysis:** Each individual in the frame is analyzed independently — background extras or co-stars are never given duplicated celebrity names.
-- **Tip for Best Results:** Pause at a moment where Person #{active_person['id']} is facing the camera, unmasked, and in sharp focus.""")
+- **Scope:** Recognizes known actors, directors, artists, television stars, and public figures.
+- **Supporting Cast / Extras:** Supporting cast members, background actors, or uncredited individuals without an established public filmography remain unverified.
+- **Best Clarity:** For optimal results, select a frame where Person #{active_person['id']} is facing the camera and in sharp focus.""")
 
